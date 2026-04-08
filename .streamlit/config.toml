@@ -1,0 +1,21 @@
+# Create .streamlit/config.toml file in your project root
+[server]
+maxUploadSize = 200
+enableCORS = false
+enableXsrfProtection = false
+headless = true
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+[client]
+caching = true
+
+[runner]
+magicEnabled = true
+installTracer = false
+fixMatplotlib = true
+
+[global]
+developmentMode = false

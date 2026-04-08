@@ -1,0 +1,3832 @@
+import os
+import pandas as pd
+import streamlit as st
+import sqlite3
+from tools.db_utils import DatabaseConnection
+from tools.llm_tools import (SQLGenerator, generate_visualization_code, execute_visualization_code, detect_chat_intent)
+from dotenv import load_dotenv
+import plotly.express as px
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from io import BytesIO
+import base64
+from datetime import datetime
+import uuid
+
+
+PROTECTED_STUDY = "Clinical Trial 2025"
+USE_SINGLE_QUERY = False 
+
+
+st.set_page_config(
+    page_title="Data Review Assistant",
+    page_icon="📊",
+    layout="wide"
+)
+
+
+
+load_dotenv()
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
+    st.error("Please set your AWS credentials in the .env file")
+
+# Initialize study management session state
+if 'current_study' not in st.session_state:
+    st.session_state.current_study = None
+if 'available_studies' not in st.session_state:
+    st.session_state.available_studies = DatabaseConnection.list_available_studies()
+
+# Initialize database connection based on current study
+def get_current_db_connection():
+    """Get database connection for current study"""
+    if hasattr(st.session_state, 'current_study') and st.session_state.current_study:
+        return DatabaseConnection(study_name=st.session_state.current_study)
+    else:
+        # None - use default database
+        DB_PATH = os.path.join(os.getcwd(), "data", "app.db")
+        return DatabaseConnection(DB_PATH)
+
+def refresh_current_study_tables():
+    """Refresh the tables list for the current study"""
+    current_db = get_current_db_connection()
+    st.session_state.tables = current_db.list_tables()
+    return current_db
+
+# Initialize global db connection safely
+try:
+    if 'current_study' in st.session_state and st.session_state.current_study:
+        db = DatabaseConnection(study_name=st.session_state.current_study)
+    else:
+        # Fallback if session state isn't ready
+        DB_PATH = os.path.join(os.getcwd(), "data", "app.db")
+        db = DatabaseConnection(DB_PATH)
+except Exception as e:
+    # Ultimate fallback
+    DB_PATH = os.path.join(os.getcwd(), "data", "app.db")
+    db = DatabaseConnection(DB_PATH)
+
+# Initialize session state
+if 'tables' not in st.session_state:
+    try:
+        current_db = get_current_db_connection()
+        st.session_state.tables = current_db.list_tables()
+    except:
+        st.session_state.tables = []
+if 'sql_generator' not in st.session_state:
+    try:
+        st.session_state.sql_generator = SQLGenerator(study_name=st.session_state.current_study)
+    except:
+        
+        st.session_state.sql_generator = SQLGenerator(study_name=None)
+if 'selected_question' not in st.session_state:
+    st.session_state.selected_question = ""
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = [(None, """👋 Welcome! Please upload your data files to begin analysis.""")]
+if 'chat_histories' not in st.session_state:
+    st.session_state.chat_histories = {}  # Dictionary to store per-study histories
+if 'last_processed_question' not in st.session_state:
+    st.session_state.last_processed_question = None  # Track the last processed question to avoid duplicates
+if 'chat_input_key' not in st.session_state:
+    st.session_state.chat_input_key = 0  # Dynamic key to reset chat input
+if 'processing_question' not in st.session_state:
+    st.session_state.processing_question = False  # Flag to prevent duplicate processing
+if 'show_delete_confirmation' not in st.session_state:
+    st.session_state.show_delete_confirmation = False  # Flag for delete confirmation dialog
+if 'study_to_delete' not in st.session_state:
+    st.session_state.study_to_delete = None  # Store study name pending deletion
+if 'pending_deletion' not in st.session_state:
+    st.session_state.pending_deletion = None  # Store study name pending deletion (welcome screen)
+if 'awaiting_deletion_selection' not in st.session_state:
+    st.session_state.awaiting_deletion_selection = False  # Flag for awaiting study selection for deletion
+
+# Conversation state management for chat-based interface
+if 'conversation_mode' not in st.session_state:
+    st.session_state.conversation_mode = 'normal'  # 'normal', 'awaiting_study_name', 'awaiting_file_upload', etc.
+if 'pending_action' not in st.session_state:
+    st.session_state.pending_action = None  # Store action details while waiting for user input
+if 'last_intent' not in st.session_state:
+    st.session_state.last_intent = None  # Track last detected intent for context
+if 'context_data' not in st.session_state:
+    st.session_state.context_data = {}  # Store context for multi-step operations
+
+# Interactive workflow state management
+if 'workflow_step' not in st.session_state:
+    st.session_state.workflow_step = None  # 'create_study_name', 'upload_protocol', 'upload_data'
+if 'pending_study_name' not in st.session_state:
+    st.session_state.pending_study_name = None  # Store study name during creation workflow
+if 'selected_study_for_switch' not in st.session_state:
+    st.session_state.selected_study_for_switch = None  # Store selected study for switching
+if 'widget_keys' not in st.session_state:
+    st.session_state.widget_keys = {}  # Track unique keys for widgets in chat
+
+# Temporary storage for workflow files (new approach)
+if 'pending_files' not in st.session_state:
+    st.session_state.pending_files = []  # List of {df, table_name, filename} dicts
+if 'pending_protocol_file' not in st.session_state:
+    st.session_state.pending_protocol_file = None  # {filename, content} dict
+if 'show_welcome_screen' not in st.session_state:
+    st.session_state.show_welcome_screen = True  # Show welcome screen on first load
+
+# --- COLUMN HEADER MAPPING SETUP ---
+# Load column mapping from QUESTIONS.csv at startup and store in session state
+def load_column_mappings(study_name=None):
+    """Load column mappings for the specified study"""
+    if study_name:
+        mapping_csv_path = os.path.join("studies", study_name, "protocols", "QUESTIONS.csv")
+    else:
+        mapping_csv_path = os.path.join("protocols", "QUESTIONS.csv")
+    
+    if os.path.exists(mapping_csv_path):
+        try:
+            mapping_df = pd.read_csv(mapping_csv_path)
+            if 'Variable Name' in mapping_df.columns and 'Label' in mapping_df.columns:
+                mapping_dict = dict(zip(mapping_df['Variable Name'], mapping_df['Label']))
+                st.session_state['column_mappings'] = mapping_dict
+            else:
+                st.session_state['column_mappings'] = {}
+                st.warning("QUESTIONS.csv missing required columns 'Variable Name' and 'Label'.")
+        except Exception as e:
+            st.session_state['column_mappings'] = {}
+            st.warning(f"Could not read QUESTIONS.csv: {e}")
+    else:
+        st.session_state['column_mappings'] = {}
+
+# Load mappings for current study
+load_column_mappings(st.session_state.current_study)
+
+# Helper function to apply column mapping to DataFrames
+def apply_column_mapping(df):
+    mapping = st.session_state.get('column_mappings', {})
+    if not mapping or not isinstance(df, pd.DataFrame):
+        return df
+    # Only rename columns that are in the mapping
+    return df.rename(columns={col: mapping.get(col, col) for col in df.columns})
+
+# Define callback to handle chat input to ensure consistent processing
+def handle_chat_input(text_input):
+    """Handle chat input and prevent duplicate processing"""
+    if not text_input or st.session_state.processing_question:
+        return
+    
+    st.session_state.processing_question = True
+    st.session_state.current_question = text_input
+    st.rerun()  # Force a rerun to process the question
+
+# Chat history management functions
+def display_chat_message(role, content):
+    """Display a single chat message"""
+    with st.chat_message(role if role else "assistant"):
+        if isinstance(content, tuple):
+            file_obj, media_tag = content
+            ext = os.path.splitext(file_obj)[-1].lower()
+            if ext in [".png", ".jpg", ".jpeg"]:
+                st.image(file_obj)
+            else:
+                st.markdown(f"🔎 File: `{os.path.basename(file_obj)}`")
+        elif isinstance(content, dict) and content.get('type') == 'dataframe':
+            st.dataframe(apply_column_mapping(content['data']))
+        elif isinstance(content, dict) and content.get('type') == 'protocol_summary':
+            with st.container():
+                col1, col2 = st.columns([0.95, 0.05])
+                with col1:
+                    st.markdown("**Data Summary:**")
+                with col2:
+                    if st.button("📥", key=content['button_key'], help="Download Protocol Summary as PDF"):
+                        pdf_buffer = generate_pdf_content(content['summary'])
+                        st.download_button(
+                            label="Download PDF",
+                            data=pdf_buffer,
+                            file_name="protocol_summary.pdf",
+                            mime="application/pdf",
+                            key=f"download_pdf_{content['button_key']}"
+                        )
+                st.markdown(content['summary'])
+        elif isinstance(content, dict) and content.get('type') == 'sql_queries_expander':
+            # Display SQL queries in a collapsible expander
+            with st.expander("Generated SQL Query", expanded=False):
+                for i, query in enumerate(content['queries']):
+                    st.markdown(f"**Query {i+1}:**")
+                    st.code(query, language="sql")
+        elif isinstance(content, dict) and content.get('type') == 'viz':
+            st.markdown(content['desc'])
+            st.plotly_chart(content['fig'], use_container_width=True)
+        else:
+            st.markdown(content)
+
+def update_chat_display():
+    """Display all messages in chat history"""
+    for role, content in st.session_state.chat_history:
+        display_chat_message(role, content)
+
+def add_message(role, content):
+    """Add a message to chat history and update display (legacy function - redirects to study-specific)"""
+    add_message_to_current_study(role, content)
+
+# Study-specific chat history helper functions
+def get_current_chat_history():
+    """Get chat history for current study"""
+    if st.session_state.current_study:
+        study_key = st.session_state.current_study
+    else:
+        study_key = "legacy_mode"
+    
+    if study_key not in st.session_state.chat_histories:
+        st.session_state.chat_histories[study_key] = [(None, """👋 Welcome! Please upload your data files to begin analysis.""")]
+    
+    return st.session_state.chat_histories[study_key]
+
+def add_message_to_current_study(role, content):
+    """Add message to current study's chat history"""
+    current_history = get_current_chat_history()
+    current_history.append((role, content))
+    # Update the global chat_history reference for backward compatibility
+    if st.session_state.current_study:
+        study_key = st.session_state.current_study
+    else:
+        study_key = "legacy_mode"
+    st.session_state.chat_history = st.session_state.chat_histories[study_key]
+
+def clear_current_study_chat():
+    """Clear chat history for current study"""
+    if st.session_state.current_study:
+        study_key = st.session_state.current_study
+    else:
+        study_key = "legacy_mode"
+    
+    st.session_state.chat_histories[study_key] = [(None, """👋 Welcome! Please upload your data files to begin analysis.""")]
+    st.session_state.chat_history = st.session_state.chat_histories[study_key]
+
+def sync_chat_history():
+    """Sync current chat history with study-specific storage"""
+    if st.session_state.current_study:
+        study_key = st.session_state.current_study
+    else:
+        study_key = "legacy_mode"
+    
+    # Ensure study-specific chat exists
+    if study_key not in st.session_state.chat_histories:
+        st.session_state.chat_histories[study_key] = [(None, """👋 Welcome! Please upload your data files to begin analysis.""")]
+    
+    # Update global reference to point to current study's chat
+    st.session_state.chat_history = st.session_state.chat_histories[study_key]
+
+# Chat-based widget functions for conversational interface
+def handle_chat_study_management(intent_data):
+    """Handle study management through chat commands"""
+    parameters = intent_data.get('parameters', {})
+    action = parameters.get('action', '')
+    study_name = parameters.get('study_name', '')
+    
+    if action == 'create':
+        if study_name:
+            return create_study_via_chat(study_name)
+        else:
+            st.session_state.conversation_mode = 'awaiting_study_name'
+            st.session_state.pending_action = {'type': 'create_study'}
+            return "What would you like to name the new study?"
+    
+    elif action == 'switch' or action == 'select':
+        if study_name:
+            return switch_study_via_chat(study_name)
+        else:
+            available_studies = st.session_state.available_studies
+            if available_studies:
+                studies_list = "\n".join([f"• {study}" for study in available_studies])
+                st.session_state.conversation_mode = 'awaiting_study_selection'
+                st.session_state.pending_action = {'type': 'switch_study'}
+                return f"Available studies:\n{studies_list}\n\nWhich study would you like to switch to?"
+            else:
+                return "No studies are currently available. Would you like to create a new study?"
+    
+    elif action == 'list' or 'show' in action.lower() or 'available' in action.lower():
+        available_studies = st.session_state.available_studies
+        if available_studies:
+            studies_list = "\n".join([f"• {study}" for study in available_studies])
+            current = st.session_state.current_study or "None"
+            return f"**Available Studies:**\n{studies_list}\n\n**Current Study:** {current}"
+        else:
+            return "No studies are currently available. Would you like to create a new study?"
+    
+    else:
+        return "I can help you create a new study, switch between studies, or list available studies. What would you like to do?"
+
+def handle_chat_file_upload(intent_data):
+    """Handle file upload through chat commands"""
+    parameters = intent_data.get('parameters', {})
+    file_type = parameters.get('file_type', '').lower()
+    
+    st.session_state.conversation_mode = 'awaiting_file_upload'
+    st.session_state.pending_action = {'type': 'file_upload', 'file_type': file_type}
+    
+    if file_type in ['csv', 'excel', 'xlsx']:
+        st.session_state.workflow_step = 'upload_data'
+        return f"Perfect! I'll help you upload your {file_type.upper()} file. The upload interface will appear below this chat."
+    elif file_type in ['pdf', 'protocol']:
+        st.session_state.workflow_step = 'upload_protocol'
+        return "Perfect! I'll help you upload your protocol file. The upload interface will appear below this chat."
+    else:
+        st.session_state.workflow_step = 'file_upload'
+        return "Perfect! I'll help you upload your files. The upload interface will appear below this chat."
+
+def create_study_via_chat(study_name):
+    """Create a new study via chat command"""
+    try:
+        if study_name in st.session_state.available_studies:
+            return f"A study named '{study_name}' already exists. Please choose a different name."
+        
+        # Create the study directory structure
+        study_dir = os.path.join("studies", study_name)
+        os.makedirs(study_dir, exist_ok=True)
+        os.makedirs(os.path.join(study_dir, "data"), exist_ok=True)
+        os.makedirs(os.path.join(study_dir, "protocols"), exist_ok=True)
+        
+        # Update available studies
+        st.session_state.available_studies = DatabaseConnection.list_available_studies()
+        
+        # Switch to the new study
+        st.session_state.current_study = study_name
+        st.session_state.conversation_mode = 'normal'
+        st.session_state.pending_action = None
+        
+        # Reinitialize database and related components
+        db = get_current_db_connection()
+        st.session_state.tables = db.list_tables()
+        st.session_state.sql_generator = SQLGenerator(study_name=study_name)
+        
+        # Sync chat history for new study
+        sync_chat_history()
+        
+        return f"✅ Successfully created and switched to study '{study_name}'. You can now upload data files to begin analysis."
+        
+    except Exception as e:
+        return f"❌ Error creating study: {str(e)}"
+
+def switch_study_via_chat(study_name):
+    """Switch to an existing study via chat command"""
+    try:
+        if study_name not in st.session_state.available_studies:
+            available_studies = "\n".join([f"• {study}" for study in st.session_state.available_studies])
+            return f"Study '{study_name}' not found. Available studies:\n{available_studies}"
+        
+        # Switch to the study
+        st.session_state.current_study = study_name
+        st.session_state.conversation_mode = 'normal'
+        st.session_state.pending_action = None
+        
+        # Reinitialize database and related components
+        db = get_current_db_connection()
+        st.session_state.tables = db.list_tables()
+        st.session_state.sql_generator = SQLGenerator(study_name=study_name)
+        
+        # Sync chat history for the study
+        sync_chat_history()
+        
+        # Load column mappings for this study
+        load_column_mappings(study_name)
+        
+        tables_info = f"({len(st.session_state.tables)} tables)" if st.session_state.tables else "(no data uploaded yet)"
+        
+        return f"✅ Switched to study '{study_name}' {tables_info}. How can I help you analyze the data?"
+        
+    except Exception as e:
+        return f"❌ Error switching to study: {str(e)}"
+
+def handle_conversation_context(user_message):
+    """Handle conversational context and multi-step operations"""
+    
+    # Check if we're in a special conversation mode
+    if st.session_state.conversation_mode == 'awaiting_study_name':
+        # User is providing a study name for creation
+        study_name = user_message.strip()
+        st.session_state.conversation_mode = 'normal'
+        st.session_state.pending_action = None
+        return create_study_via_chat(study_name)
+    
+    elif st.session_state.conversation_mode == 'awaiting_study_selection':
+        # User is selecting a study to switch to
+        study_name = user_message.strip()
+        st.session_state.conversation_mode = 'normal'
+        st.session_state.pending_action = None
+        return switch_study_via_chat(study_name)
+    
+    elif st.session_state.conversation_mode == 'awaiting_file_upload':
+        # User might be asking about file upload or providing more details
+        return "Please use the **File Upload** section in the sidebar to upload your data file. I'll process it automatically once uploaded."
+    
+    # Normal conversation mode - return None to continue with intent detection
+    return None
+
+# Interactive workflow functions for conversational interface
+def render_study_name_input():
+    """Show study name input instructions in chat"""
+    st.markdown("**Please enter the name for your new study in the chat below:**")
+    st.markdown("💬 Type your study name in the chat input box and press Enter")
+    st.markdown("📝 Example: `Clinical Trial 2025` or `Research Study Alpha`")
+    st.markdown("---")
+
+def render_protocol_uploader():
+    """Show protocol file uploader in chat"""
+    is_in_creation_workflow = st.session_state.get('pending_study_name') is not None
+    
+    if is_in_creation_workflow:
+        st.markdown("**Step 2: Upload Protocol File (Optional)**")
+        st.caption("Upload a PDF protocol file for this study")
+    else:
+        st.markdown("**Upload Protocol File**")
+        st.caption("Upload a PDF protocol file for your current study")
+    
+    # Create unique key for this widget
+    widget_key = f"protocol_upload_{len(st.session_state.chat_history)}"
+    
+    uploaded_protocol = st.file_uploader(
+        "Choose protocol PDF file",
+        type=['pdf'],
+        key=widget_key,
+        help="Upload your study protocol document"
+    )
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if is_in_creation_workflow:
+            if st.button("Skip Protocol", key=f"skip_protocol_{widget_key}"):
+                st.session_state.workflow_step = 'upload_data'
+                add_message_to_current_study("user", "Skip protocol upload")
+                add_message_to_current_study(None, "Skipping protocol upload. Now let's upload your data files...")
+                st.rerun()
+        else:
+            if st.button("Done", key=f"done_protocol_{widget_key}"):
+                st.session_state.workflow_step = None
+                add_message_to_current_study(None, "Protocol upload completed.")
+                st.rerun()
+    
+    if uploaded_protocol is not None:
+        try:
+            # Store protocol file in session state instead of saving immediately
+            st.session_state.pending_protocol_file = {
+                'filename': uploaded_protocol.name,
+                'content': uploaded_protocol.getbuffer()
+            }
+            
+            if is_in_creation_workflow:
+                st.success(f"✅ Protocol file '{uploaded_protocol.name}' ready for upload")
+                st.info("Protocol will be saved when you complete the study setup.")
+                
+                # Move to data upload step
+                st.session_state.workflow_step = 'upload_data'
+                add_message_to_current_study("user", f"Protocol ready: {uploaded_protocol.name}")
+                add_message_to_current_study(None, f"✅ Protocol file ready for upload. Now let's add your data files...")
+            else:
+                # For non-workflow uploads, save immediately to current study
+                study_name = st.session_state.get('current_study')
+                if study_name:
+                    protocols_dir = os.path.join("studies", study_name, "protocols")
+                    os.makedirs(protocols_dir, exist_ok=True)
+                else:
+                    protocols_dir = os.path.join(os.getcwd(), "protocols")
+                    os.makedirs(protocols_dir, exist_ok=True)
+                
+                # Save protocol file immediately for existing studies
+                protocol_path = os.path.join(protocols_dir, "protocol.pdf")
+                with open(protocol_path, "wb") as f:
+                    f.write(uploaded_protocol.getbuffer())
+                
+                st.session_state.workflow_step = None
+                add_message_to_current_study("user", f"Uploaded protocol: {uploaded_protocol.name}")
+                add_message_to_current_study(None, f"✅ Protocol file uploaded successfully!")
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"Error processing protocol: {str(e)}")
+
+def render_data_uploader():
+    """Show data file uploader in chat with temporary storage"""
+    is_in_creation_workflow = st.session_state.get('pending_study_name') is not None
+    
+    if is_in_creation_workflow:
+        st.markdown("**Step 3: Upload Data Files**")
+        st.caption("Upload CSV or Excel files containing your study data")
+    else:
+        st.markdown("**Upload Data Files**")
+        st.caption("Upload data files to your current study")
+    
+    # Show pending files summary if any
+    pending_files = st.session_state.get('pending_files', [])
+    if pending_files:
+        st.info(f"📋 {len(pending_files)} file(s) ready for upload")
+        with st.expander("View pending files", expanded=False):
+            for i, file_data in enumerate(pending_files):
+                col1, col2, col3 = st.columns([3, 1, 1])
+                with col1:
+                    st.write(f"**{file_data['filename']}**")
+                    st.caption(f"Table: {file_data['table_name']} | {len(file_data['df'])} rows × {len(file_data['df'].columns)} columns")
+                with col2:
+                    if st.button("👁️", key=f"preview_{i}", help="Preview data"):
+                        st.dataframe(file_data['df'].head(), use_container_width=True)
+                with col3:
+                    if st.button("🗑️", key=f"remove_{i}", help="Remove file"):
+                        st.session_state.pending_files.pop(i)
+                        st.rerun()
+    
+    # Create unique key for this widget
+    widget_key = f"data_upload_{len(st.session_state.chat_history)}"
+    
+    uploaded_data = st.file_uploader(
+        "Choose data files",
+        type=['csv', 'xlsx'],
+        accept_multiple_files=True,
+        key=widget_key,
+        help="Upload your study data files (CSV or Excel format)"
+    )
+    
+    # Place Complete Setup button on the left side below the file uploader
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if st.button("Complete Setup", key=f"complete_setup_{widget_key}"):
+            complete_study_setup_without_data()
+    
+    if uploaded_data:
+        # Process files immediately but store in session state
+        new_files_added = []
+        for uploaded_file in uploaded_data:
+            try:
+                # Check if file already in pending list
+                existing_names = [f['filename'] for f in pending_files]
+                if uploaded_file.name in existing_names:
+                    st.warning(f"File {uploaded_file.name} already added. Skipping...")
+                    continue
+                
+                # Read the file
+                if uploaded_file.name.endswith('.csv'):
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
+                
+                # Create table name from file name
+                table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
+                
+                # Store in session state instead of saving to database
+                file_data = {
+                    'df': df,
+                    'table_name': table_name,
+                    'filename': uploaded_file.name
+                }
+                
+                if is_in_creation_workflow:
+                    st.session_state.pending_files.append(file_data)
+                    new_files_added.append(uploaded_file.name)
+                else:
+                    # For non-workflow uploads, save immediately to current study
+                    current_db = get_current_db_connection()
+                    current_db.save_dataframe(df, table_name)
+                    add_message_to_current_study(None, f"✅ Successfully uploaded {uploaded_file.name} as table '{table_name}' ({len(df)} rows)")
+                
+            except Exception as e:
+                st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+        
+        if new_files_added and is_in_creation_workflow:
+            st.success(f"✅ {len(new_files_added)} file(s) ready for upload")
+            st.info("Files will be saved when you complete the study setup.")
+            
+            # Update chat with the new files
+            files_text = ", ".join(new_files_added)
+            add_message_to_current_study("user", f"Data files ready: {files_text}")
+            add_message_to_current_study(None, f"✅ {len(new_files_added)} data file(s) ready for upload. Click 'Complete Setup' to finish creating your study.")
+            st.rerun()
+
+def handle_study_creation_complete(uploaded_files):
+    """Complete study creation process with uploaded files"""
+    try:
+        study_name = st.session_state.pending_study_name
+        
+        # Create study directory structure
+        study_dir = os.path.join("studies", study_name)
+        os.makedirs(study_dir, exist_ok=True)
+        os.makedirs(os.path.join(study_dir, "data"), exist_ok=True)
+        os.makedirs(os.path.join(study_dir, "protocols"), exist_ok=True)
+        
+        # Process uploaded files
+        processed_files = []
+        db = get_current_db_connection()
+        
+        for uploaded_file in uploaded_files:
+            try:
+                # Read the file
+                if uploaded_file.name.endswith('.csv'):
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
+                
+                # Create table name from file name
+                table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
+                
+                # Save to database
+                db.save_dataframe(df, table_name)
+                processed_files.append(f"{uploaded_file.name} → {table_name} ({len(df)} rows)")
+                
+            except Exception as e:
+                st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+        
+        # Update available studies and switch to new study
+        st.session_state.available_studies = DatabaseConnection.list_available_studies()
+        st.session_state.current_study = study_name
+        
+        # Reinitialize database connection for new study
+        db = refresh_current_study_tables()
+        st.session_state.sql_generator = SQLGenerator(study_name=study_name)
+        
+        # Reset workflow state
+        st.session_state.workflow_step = None
+        st.session_state.pending_study_name = None
+        
+        # Clear chat and start fresh for new study
+        st.session_state.chat_histories[study_name] = [
+            (None, f"🎉 **Study '{study_name}' created successfully!**")
+        ]
+        if processed_files:
+            file_summary = "\n".join([f"• {file}" for file in processed_files])
+            st.session_state.chat_histories[study_name].append(
+                (None, f"**Data files processed:**\n{file_summary}")
+            )
+        
+        st.session_state.chat_histories[study_name].append(
+            (None, "You can now start analyzing your data! Try asking questions like 'Show me all patients' or 'List all tables'.")
+        )
+        
+        # Sync to current chat
+        sync_chat_history()
+        
+        add_message_to_current_study("user", f"Complete setup with {len(uploaded_files)} files")
+        st.rerun()
+        
+    except Exception as e:
+        st.error(f"Error completing study setup: {str(e)}")
+
+def complete_study_setup_without_data():
+    """Complete study setup and transfer all pending files"""
+    try:
+        # Get the pending study name (created during workflow)
+        pending_study = st.session_state.get('pending_study_name')
+        
+        if not pending_study:
+            st.error("No pending study found")
+            return
+
+        # 1. Create database connection for new study
+        study_db = DatabaseConnection(study_name=pending_study)
+        
+        # 2. Transfer all pending data files
+        transferred_files = []
+        pending_files = st.session_state.get('pending_files', [])
+        
+        print(f"DEBUG: Starting transfer of {len(pending_files)} pending files to study '{pending_study}'")
+        
+        for file_data in pending_files:
+            try:
+                df = file_data['df']
+                table_name = file_data['table_name']
+                filename = file_data['filename']
+                
+                print(f"DEBUG: Transferring {filename} as table '{table_name}' with {len(df)} rows")
+                study_db.save_dataframe(df, table_name)
+                transferred_files.append(filename)
+                print(f"DEBUG: Successfully transferred {filename}")
+                
+            except Exception as e:
+                print(f"ERROR: Failed to transfer {file_data['filename']}: {e}")
+                st.error(f"❌ Failed to transfer {file_data['filename']}: {e}")
+        
+        print(f"DEBUG: Transfer complete. {len(transferred_files)} files transferred successfully")
+        
+        # 3. Transfer protocol file if exists
+        protocol_transferred = False
+        if st.session_state.get('pending_protocol_file'):
+            try:
+                protocol_data = st.session_state.pending_protocol_file
+                protocols_dir = os.path.join("studies", pending_study, "protocols")
+                os.makedirs(protocols_dir, exist_ok=True)
+                protocol_path = os.path.join(protocols_dir, "protocol.pdf")
+                with open(protocol_path, "wb") as f:
+                    f.write(protocol_data['content'])
+                protocol_transferred = True
+            except Exception as e:
+                st.error(f"❌ Failed to transfer protocol: {e}")
+        
+        # 4. NOW switch to new study interface
+        st.session_state.current_study = pending_study
+        st.session_state.available_studies = DatabaseConnection.list_available_studies()
+        
+        # 5. Clean up workflow state and pending files
+        st.session_state.workflow_step = None
+        st.session_state.pending_study_name = None
+        st.session_state.pending_files = []
+        st.session_state.pending_protocol_file = None
+        
+        # 6. Initialize new study environment - CRITICAL: Update global db first
+        global db
+        db = get_current_db_connection()  # This will now connect to the new study
+        st.session_state.tables = db.list_tables()  # Refresh tables from new study
+        st.session_state.sql_generator = SQLGenerator(study_name=pending_study)
+        
+        # 7. Load column mappings for new study
+        load_column_mappings(pending_study)
+        
+        # 8. Verify tables were created successfully
+        final_tables = db.list_tables()
+        print(f"DEBUG: Final verification - study '{pending_study}' has {len(final_tables)} tables: {final_tables}")
+        
+        if not final_tables and transferred_files:
+            print(f"ERROR: No tables found despite transferring {len(transferred_files)} files!")
+            st.error(f"⚠️ Warning: Files were transferred but no tables found in database. This may indicate a database connection issue.")
+        
+        # 9. Create success message with transfer summary
+        file_summary = f"{len(transferred_files)} data files" if transferred_files else "no data files"
+        protocol_summary = "with protocol" if protocol_transferred else "without protocol"
+        
+        success_message = f"🎉 Study '{pending_study}' created successfully with {file_summary} {protocol_summary}!"
+        
+        # If we have tables, include table information in success message
+        if final_tables:
+            table_list = ", ".join(final_tables)
+            success_message += f"\n\n📊 **Tables created:** {table_list}"
+        
+        # 10. Set up chat history for new study
+        st.session_state.chat_histories[pending_study] = [
+            (None, success_message),
+            (None, "Your study is ready! You can start asking questions about your data." if transferred_files else "Study is ready! You can upload data files anytime by saying 'upload data file' or start with the example questions.")
+        ]
+        st.session_state.chat_history = st.session_state.chat_histories[pending_study]
+        
+        # Add completion message
+        with st.chat_message("assistant"):
+            st.markdown(success_message)
+        
+        add_message_to_current_study("user", "Complete setup")
+        st.rerun()
+        
+    except Exception as e:
+        st.error(f"Error completing study setup: {str(e)}")
+        # Keep workflow state on error - don't lose pending files
+
+def cleanup_abandoned_workflow():
+    """Clean up workflow state when user abandons study creation"""
+    pending_study_name = st.session_state.get('pending_study_name')
+    
+    # Clear workflow state
+    st.session_state.workflow_step = None
+    st.session_state.pending_study_name = None
+    st.session_state.pending_files = []
+    st.session_state.pending_protocol_file = None
+    
+    # Optionally delete empty study directory if created
+    if pending_study_name:
+        study_dir = os.path.join("studies", pending_study_name)
+        if os.path.exists(study_dir):
+            try:
+                import shutil
+                # Only delete if directory is empty or contains only empty subdirectories
+                for root, dirs, files in os.walk(study_dir):
+                    if files:  # Has files, don't delete
+                        return
+                shutil.rmtree(study_dir)
+            except Exception:
+                pass  # Ignore cleanup errors
+
+def render_workflow_progress():
+    """Show workflow progress only for study creation workflows"""
+    if not st.session_state.workflow_step:
+        return
+    
+    # Only show progress for study creation workflow steps
+    creation_steps = ['create_study_name', 'upload_protocol', 'upload_data']
+    if st.session_state.workflow_step not in creation_steps:
+        return  # Skip rendering for non-creation workflows
+    
+    st.sidebar.markdown("### 🔄 Study Creation Progress")
+    
+    # Progress steps
+    steps_order = ['create_study_name', 'upload_protocol', 'upload_data']
+    steps = {
+        'create_study_name': '✅ Study Name',
+        'upload_protocol': '📄 Protocol File',
+        'upload_data': '📊 Data Files'
+    }
+    
+    current_step = st.session_state.workflow_step
+    for step_key, step_name in steps.items():
+        if step_key == current_step:
+            st.sidebar.markdown(f"**→ {step_name}** (current)")
+        elif steps_order.index(step_key) < steps_order.index(current_step):
+            st.sidebar.markdown(f"✅ {step_name}")
+        else:
+            st.sidebar.markdown(f"⭕ {step_name}")
+    
+    # Show pending files summary
+    pending_count = len(st.session_state.get('pending_files', []))
+    protocol_pending = bool(st.session_state.get('pending_protocol_file'))
+    
+    if pending_count > 0 or protocol_pending:
+        st.sidebar.markdown("### 📋 Pending Files")
+        if protocol_pending:
+            st.sidebar.markdown(f"📄 Protocol: {st.session_state.pending_protocol_file['filename']}")
+        if pending_count > 0:
+            st.sidebar.markdown(f"📊 Data files: {pending_count}")
+            for file_data in st.session_state.pending_files:
+                st.sidebar.markdown(f"  • {file_data['filename']} ({len(file_data['df'])} rows)")
+    
+    # Add cancel workflow button
+    if st.sidebar.button("❌ Cancel Study Creation", key="cancel_workflow", help="Cancel study creation and clear pending files"):
+        cleanup_abandoned_workflow()
+        st.sidebar.success("Study creation cancelled")
+        st.rerun()
+
+def render_study_selector_checkboxes():
+    """Show study list with checkboxes for selection"""
+    available_studies = st.session_state.available_studies
+    current_study = st.session_state.current_study
+    
+    if not available_studies:
+        st.info("No studies available. Create a new study to get started!")
+        return
+    
+    st.markdown("**Available Studies:**")
+    
+    # Show current study info
+    if current_study:
+        st.success(f"📍 Currently active: **{current_study}**")
+    else:
+        st.info("📍 Currently in none (no study selected)")
+    
+    st.markdown("**Select a study to switch to:**")
+    
+    # Initialize selected study tracking if not exists
+    if 'selected_study_for_switch' not in st.session_state:
+        st.session_state.selected_study_for_switch = None
+    
+    # Create checkboxes for each study (only show non-current studies)
+    studies_to_show = [study for study in available_studies if study != current_study]
+    
+    if not studies_to_show:
+        st.info("No other studies available to switch to.")
+        return
+    
+    # Use radio buttons instead of checkboxes for single selection
+    study_options = studies_to_show
+    
+    # Get current selection index
+    current_selection = st.session_state.selected_study_for_switch
+    if current_selection and current_selection in studies_to_show:
+        default_index = studies_to_show.index(current_selection)
+    else:
+        default_index = 0
+    
+    selected_option = st.radio(
+        "Select a study:",
+        options=study_options,
+        index=default_index,
+        key="study_radio_selector"
+    )
+    
+    # Update session state based on selection
+    st.session_state.selected_study_for_switch = selected_option
+    
+    # Always show Switch button on the left
+    st.markdown("---")
+    
+    # Switch button
+    has_selection = st.session_state.selected_study_for_switch is not None
+    button_text = f"🔄 Switch to {st.session_state.selected_study_for_switch}" if has_selection else "🔄 Switch Study"
+    
+    if st.button(
+        button_text,
+        key="switch_study_btn",
+        type="primary" if has_selection else "secondary",
+        disabled=not has_selection,
+        use_container_width=True,
+        help="Select a study above to enable switching" if not has_selection else f"Click to switch to {st.session_state.selected_study_for_switch}"
+    ):
+        if has_selection:
+            # Attempt the switch with proper error handling
+            switch_success = switch_study_and_reset_chat(st.session_state.selected_study_for_switch)
+            
+            if switch_success:
+                # Only clear state and hide selector if switch was successful
+                st.session_state.selected_study_for_switch = None
+                st.session_state.show_study_selector = False
+                st.session_state.last_study_list_question = None
+                st.session_state.show_welcome_screen = False  # Exit welcome screen on successful switch
+                st.rerun()
+            else:
+                # Keep selection and show error - don't exit welcome screen
+                st.error("Failed to switch study. Please try again.")
+    
+    # Show delete confirmation dialog if needed
+    if st.session_state.get('show_delete_confirmation', False):
+        study_to_delete = st.session_state.get('study_to_delete')
+        if study_to_delete:
+            st.markdown("---")
+            st.error(f"⚠️ **DELETE STUDY CONFIRMATION**")
+            
+            # Instructions for chat-based confirmation - use simple pending deletion instead
+            st.info(f"📝 **Type '{study_to_delete}' in the chat below to confirm deletion, or type 'cancel' to abort.**")
+            
+            # Use simple pending deletion instead of conversation mode
+            st.session_state.pending_deletion = study_to_delete
+            
+            col_del1, col_del2, col_del3 = st.columns([1, 1, 2])
+            with col_del1:
+                if st.button("❌ Cancel Delete", key="cancel_delete_btn"):
+                    st.session_state.show_delete_confirmation = False
+                    st.session_state.study_to_delete = None
+                    st.session_state.pending_deletion = None
+                    st.rerun()
+
+def switch_study_and_reset_chat(study_name):
+    """Switch to selected study and create fresh chat interface with proper error handling"""
+    try:
+        # Validate study exists before switching
+        available_studies = DatabaseConnection.list_available_studies()
+        if study_name not in available_studies:
+            st.error(f"❌ Study '{study_name}' not found in available studies.")
+            return False
+        
+        # Clear selection state first to prevent conflicts
+        st.session_state.selected_study_for_switch = None
+        
+        # Switch to the study
+        old_study = st.session_state.current_study
+        st.session_state.current_study = study_name
+        
+        # Reinitialize database and related components with error handling
+        try:
+            current_db = get_current_db_connection()
+            st.session_state.tables = current_db.list_tables()
+            st.session_state.sql_generator = SQLGenerator(study_name=study_name)
+            
+            # Load column mappings for this study
+            load_column_mappings(study_name)
+        except Exception as db_error:
+            # Rollback to previous study if database initialization fails
+            st.session_state.current_study = old_study
+            st.error(f"❌ Failed to initialize database for study '{study_name}': {str(db_error)}")
+            return False
+        
+        # Ensure chat history exists for this study
+        if study_name not in st.session_state.chat_histories:
+            # Get study metadata for welcome message
+            table_count = len(st.session_state.tables) if st.session_state.tables else 0
+            st.session_state.chat_histories[study_name] = [
+                (None, f"👋 Welcome to study **'{study_name}'**!"),
+                (None, f"📊 This study has {table_count} data tables available." if table_count > 0 else "📊 No data tables found. You can upload data files to get started."),
+                (None, "How can I help you analyze the data today?")
+            ]
+        
+        # Sync to current study's chat
+        sync_chat_history()
+        
+        # Add switch confirmation to chat
+        add_message_to_current_study("user", f"Switch to {study_name}")
+        add_message_to_current_study(None, f"✅ Switched to study '{study_name}' successfully!")
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error switching to study '{study_name}': {str(e)}")
+        return False
+        
+        # Show success message
+        st.success(f"Switched to study: {study_name}")
+        st.rerun()
+        
+    except Exception as e:
+        st.error(f"❌ Error switching to study: {str(e)}")
+
+def render_file_uploader():
+    """Render file uploader widget for the current study"""
+    current_study = st.session_state.get('current_study', 'default')
+    
+    # Create a unique key for this uploader
+    widget_key = f"file_upload_{current_study}_{st.session_state.get('workflow_counter', 0)}"
+    
+    uploaded_files = st.file_uploader(
+        "Choose CSV or Excel files to upload",
+        type=['csv', 'xlsx', 'xls'],
+        accept_multiple_files=True,
+        key=widget_key
+    )
+    
+    # Add Done button on the left side, right below the file uploader
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("Done", key=f"done_upload_{widget_key}"):
+            # Process any uploaded files when Done is clicked
+            if uploaded_files:
+                try:
+                    db = get_current_db_connection()
+                    processed_files = []
+                    
+                    for uploaded_file in uploaded_files:
+                        try:
+                            # Read the file
+                            if uploaded_file.name.endswith('.csv'):
+                                df = pd.read_csv(uploaded_file)
+                            else:
+                                df = pd.read_excel(uploaded_file)
+                            
+                            # Create table name from file name
+                            table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
+                            
+                            # Save to database
+                            db.save_dataframe(df, table_name)
+                            
+                            processed_files.append(f"{uploaded_file.name} → {table_name} ({len(df)} rows)")
+                            
+                        except Exception as e:
+                            st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+                    
+                    if processed_files:
+                        # Force refresh database connection and update tables list
+                        db = refresh_current_study_tables()
+                        
+                        # Show success message
+                        success_msg = f"✅ Successfully uploaded {len(processed_files)} file(s):\n" + "\n".join([f"• {f}" for f in processed_files])
+                        st.success("Files uploaded successfully!")
+                        
+                        # Add to chat history
+                        add_message_to_current_study(None, success_msg)
+                        
+                        # Clear workflow step and increment counter
+                        st.session_state.workflow_step = None
+                        st.session_state.workflow_counter = st.session_state.get('workflow_counter', 0) + 1
+                        
+                        st.rerun()
+                        return
+                    
+                except Exception as e:
+                    st.error(f"❌ Error uploading files: {str(e)}")
+                    import traceback
+                    st.error(f"Full traceback: {traceback.format_exc()}")
+            
+            # If no files uploaded or after processing, just complete the upload workflow
+            st.session_state.workflow_step = None
+            add_message_to_current_study(None, "File upload completed.")
+            st.rerun()
+
+def handle_workflow_steps(question_text):
+    """Handle multi-step workflows based on current workflow step"""
+    if st.session_state.workflow_step == 'create_study_name':
+        # This should not normally happen as the input is handled by the widget
+        # But we can handle text input as fallback
+        study_name = question_text.strip()
+        if study_name:
+            # Validate study name
+            if not DatabaseConnection.validate_study_name(study_name):
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                with st.chat_message("assistant"):
+                    st.markdown("Invalid study name. Please use only letters, numbers, spaces, hyphens, and underscores.")
+                add_message_to_current_study(None, "Invalid study name. Please use only letters, numbers, spaces, hyphens, and underscores.")
+                return
+            
+            # Check if study already exists
+            if study_name in DatabaseConnection.list_available_studies():
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                with st.chat_message("assistant"):
+                    st.markdown(f"Study '{study_name}' already exists. Please choose a different name.")
+                add_message_to_current_study(None, f"Study '{study_name}' already exists. Please choose a different name.")
+                return
+            
+            # CREATE DIRECTORY STRUCTURE ONLY (not database yet)
+            try:
+                if not DatabaseConnection.create_study_directories(study_name):
+                    raise Exception("Failed to create study directories")
+                
+                # Store study name for workflow
+                st.session_state.pending_study_name = study_name
+                st.session_state.workflow_step = 'upload_protocol'
+                
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                with st.chat_message("assistant"):
+                    st.markdown(f"Perfect! Study '{study_name}' directories created. Now let's add a protocol file (optional):")
+                add_message_to_current_study(None, f"Perfect! Study '{study_name}' directories created. Now let's add a protocol file (optional):")
+                st.rerun()
+                
+            except Exception as e:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                with st.chat_message("assistant"):
+                    st.markdown(f"Error creating study: {str(e)}")
+                add_message_to_current_study(None, f"Error creating study: {str(e)}")
+                cleanup_abandoned_workflow()
+                return
+    
+    elif st.session_state.workflow_step == 'upload_protocol':
+        # Handle text responses during protocol upload
+        add_message_to_current_study("user", question_text)
+        with st.chat_message("user"):
+            st.markdown(question_text)
+        
+        with st.chat_message("assistant"):
+            if 'skip' in question_text.lower():
+                st.session_state.workflow_step = 'upload_data'
+                st.markdown("Skipping protocol upload. Now let's upload your data files - the upload interface will appear below this chat.")
+            else:
+                st.markdown("Please upload your protocol file using the upload interface below, or say 'skip' to continue without a protocol.")
+        st.rerun()
+    
+    elif st.session_state.workflow_step == 'upload_data':
+        # Handle text responses during data upload
+        add_message_to_current_study("user", question_text)
+        with st.chat_message("user"):
+            st.markdown(question_text)
+        
+        with st.chat_message("assistant"):
+            if 'skip' in question_text.lower() or 'complete' in question_text.lower():
+                complete_study_setup_without_data()
+            else:
+                st.markdown("Please upload your data files using the upload interface below, or click 'Complete Setup' to finish without data.")
+        st.rerun()
+
+# Helper functions for file upload
+def upload_file():
+    """Handle file upload and database storage"""
+    uploaded_file = st.file_uploader("Choose a CSV or Excel file", type=['csv', 'xlsx'])
+    
+    if uploaded_file is not None:
+        try:
+            # Read the file
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
+            
+            # Create table name from file name
+            table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
+            
+            # Get fresh database connection for current study
+            current_db = get_current_db_connection()
+            # Store in database using DB-API 2.0
+            current_db.save_dataframe(df, table_name)
+            # Update session state tables list
+            st.session_state.tables = current_db.list_tables()
+            
+            # Use toast notification instead of success message
+            st.toast(f"Successfully uploaded {uploaded_file.name} as table '{table_name}'")
+            return df
+            
+        except Exception as e:
+            st.error(f"Error uploading file: {str(e)}")
+            return None
+
+def upload_files():
+    """Handle multiple file uploads and database storage"""
+    uploaded_files = st.file_uploader("Choose CSV, Excel, or PDF files", type=['csv', 'xlsx', 'pdf'], accept_multiple_files=True)
+    
+    if uploaded_files:
+        files_processed = 0
+        pdfs_processed = 0
+        # Get fresh database connection for current study
+        current_db = get_current_db_connection()
+        
+        # Determine protocols directory based on current study
+        if st.session_state.current_study:
+            protocols_dir = os.path.join(os.getcwd(), "studies", st.session_state.current_study, "protocols")
+        else:
+            protocols_dir = os.path.join(os.getcwd(), "protocols")
+        
+        # Ensure protocols directory exists
+        os.makedirs(protocols_dir, exist_ok=True)
+        
+        with st.spinner("Processing files..."):
+            for uploaded_file in uploaded_files:
+                try:
+                    # Handle PDF files differently
+                    if uploaded_file.name.endswith('.pdf'):
+                        # Save PDF to protocols directory as protocol.pdf
+                        pdf_path = os.path.join(protocols_dir, "protocol.pdf")
+                        with open(pdf_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        pdfs_processed += 1
+                        
+                    else:
+                        # Handle CSV/Excel files (existing logic)
+                        if uploaded_file.name.endswith('.csv'):
+                            df = pd.read_csv(uploaded_file)
+                        else:
+                            df = pd.read_excel(uploaded_file)
+                        
+                        # Create table name from file name
+                        table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
+                        
+                        # Store in database using DB-API 2.0
+                        current_db.save_dataframe(df, table_name)
+                        files_processed += 1
+                    
+                    # No individual success message to keep UI clean
+                    
+                except Exception as e:
+                    st.error(f"Error uploading {uploaded_file.name}: {str(e)}")
+                    continue
+        
+        # Update session state tables list after all uploads
+        st.session_state.tables = current_db.list_tables()
+        
+        # Show appropriate success messages
+        if files_processed > 0 and pdfs_processed > 0:
+            st.toast(f"Successfully processed {files_processed} data files and {pdfs_processed} protocol file(s)")
+        elif files_processed > 0:
+            st.toast(f"Successfully processed {files_processed} data files")
+        elif pdfs_processed > 0:
+            st.toast(f"Successfully uploaded {pdfs_processed} protocol file(s)")
+        
+        return True
+    return False
+
+def process_file(file_path):
+    """Process a single file and return DataFrame"""
+    try:
+        if file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        elif file_path.endswith('.xlsx') or file_path.endswith('.xls'):
+            df = pd.read_excel(file_path)
+        else:
+            return None
+        return df
+    except Exception as e:
+        st.error(f"Error processing {file_path}: {str(e)}")
+        return None
+
+def should_show_visualization(text):
+    """Check if we should show a visualization based on the query text"""
+    viz_keywords = [
+        'graph', 'chart', 'plot', 'visualize', 'visualization', 'display',
+        'bar chart', 'line chart', 'scatter plot', 'histogram', 'pie chart', 'heatmap',
+        'distribution', 'trend', 'pattern', 'compare', 'comparison', 'relationship',
+        'correlation', 'frequency', 'count', 'average', 'mean', 'median',
+        'breakdown', 'analysis', 'overview', 'summary statistics'
+    ]
+    
+    # Also check for implicit visualization requests
+    implicit_viz_phrases = [
+        'how many', 'what is the distribution', 'what does the data look like',
+        'breakdown by', 'group by', 'compare', 'relationship between', 'pattern in'
+    ]
+    
+    text_lower = str(text).lower()
+    
+    # Check for explicit visualization keywords
+    has_viz_keyword = any(word in text_lower for word in viz_keywords)
+    
+    # Check for implicit visualization phrases
+    has_implicit_viz = any(phrase in text_lower for phrase in implicit_viz_phrases)
+    
+    return has_viz_keyword or has_implicit_viz
+
+def generate_pdf_content(summary_text):
+    """Generate PDF content for the protocol summary using reportlab"""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Add title
+    title = Paragraph("Data Summary", styles['Title'])
+    story.append(title)
+    story.append(Spacer(1, 12))
+
+    # Add summary text
+    # Split text into paragraphs and escape HTML entities
+    paragraphs = summary_text.replace('&', '&').replace('<', '<').replace('>', '>').split('\n')
+    for para in paragraphs:
+        if para.strip():
+            p = Paragraph(para, styles['Normal'])
+            story.append(p)
+            story.append(Spacer(1, 6))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+def display_welcome_screen():
+    """Display the welcome screen with study options"""
+    from tools.llm_tools import generate_conversational_response
+    
+    st.subheader("Your one-stop shop for all data analytics needs.")
+    
+    with st.chat_message("assistant"):
+        st.markdown("Create Study & upload your study data to begin analytics.")
+    
+    st.markdown("### Available Studies")
+    
+    available_studies = DatabaseConnection.list_available_studies()
+    current_study = st.session_state.current_study
+    
+    if not available_studies:
+        st.info("No studies available. Create a new study to get started!")
+    else:
+        if current_study:
+            st.success(f"📍 Currently active: **{current_study}**")
+            
+            if st.button("🔄 Deactivate Current Study", key="deactivate_study_btn", type="secondary", use_container_width=True):
+                st.session_state.current_study = None
+                global db
+                db = get_current_db_connection()
+                st.session_state.sql_generator = SQLGenerator(study_name=None)
+                st.session_state.tables = db.list_tables()
+                load_column_mappings(None)
+                sync_chat_history()
+                st.success("✅ Study deactivated. You can now create a new study or switch to another one.")
+                st.rerun()
+                return
+        else:
+            st.info("📍 Currently in none (no study selected)")
+        
+        st.markdown("**Select a study to switch to:**")
+        studies_to_show = [study for study in available_studies if study != current_study]
+        
+        if not studies_to_show:
+            st.info("No other studies available to switch to.")
+        else:
+            study_display_options = []
+            study_name_map = {}
+            for study in studies_to_show:
+                if study == PROTECTED_STUDY:
+                    display_name = f"{study} 🔒 (Example)"
+                else:
+                    display_name = study
+                study_display_options.append(display_name)
+                study_name_map[display_name] = study
+            
+            selected_display_option = st.radio(
+                "Select a study:",
+                options=study_display_options,
+                index=0,
+                key="study_radio_selector_welcome"
+            )
+            selected_option = study_name_map[selected_display_option]
+            
+            col1, col2 = st.columns([2, 3])
+            with col1:
+                if st.button("📂 Activate", key="activate_study_btn_welcome", type="primary"):
+                    switch_success = switch_study_and_reset_chat(selected_option)
+                    
+                    if switch_success:
+                        st.session_state.show_welcome_screen = False
+                        response = f"✅ **Activated study: {selected_option}**\n\nPerfect! You can now query your data. What would you like to analyze?"
+                        with st.chat_message("assistant"):
+                            st.markdown(response)
+                        add_message_to_current_study(None, response)
+                        st.rerun()
+                        return
+                    else:
+                        st.error("Failed to activate study. Please try again.")
+    
+    st.markdown("---")
+    
+    chat_input_box = st.chat_input(
+        "Type your choice here...",
+        key="welcome_chat_input",
+        accept_file=True
+    )
+    
+    if st.session_state.selected_question:
+        question_text = st.session_state.selected_question
+        st.session_state.selected_question = ""
+        
+        add_message_to_current_study("user", question_text)
+        with st.chat_message("user"):
+            st.markdown(question_text)
+        
+        if any(phrase in question_text.lower() for phrase in ["new study", "create study", "start study", "make study"]):
+            st.session_state.show_welcome_screen = False
+            st.session_state.workflow_step = 'create_study_name'
+            response = "Perfect! Let's create a new study. Please provide a name for your new study:"
+            with st.chat_message("assistant"):
+                st.markdown(response)
+            add_message_to_current_study(None, response)
+            st.rerun()
+            return
+        elif "list studies" in question_text.lower():
+            response = "Here are your available studies above. You can select one to switch to it, or create a new study."
+            with st.chat_message("assistant"):
+                st.markdown(response)
+            add_message_to_current_study(None, response)
+            st.rerun()
+            return
+        elif "upload" in question_text.lower():
+            st.session_state.show_welcome_screen = False
+            if "protocol" in question_text.lower():
+                st.session_state.workflow_step = 'upload_protocol'
+                response = "I'll help you upload a protocol file. The upload interface will appear next."
+            else:
+                st.session_state.workflow_step = 'upload_data'
+                response = "I'll help you upload data files. The upload interface will appear next."
+            with st.chat_message("assistant"):
+                st.markdown(response)
+            add_message_to_current_study(None, response)
+            st.rerun()
+            return
+        else:
+            response = f"I understand you want to {question_text}. How can I help you with that?"
+            with st.chat_message("assistant"):
+                st.markdown(response)
+            add_message_to_current_study(None, response)
+            st.rerun()
+            return
+    
+    if chat_input_box:
+        if hasattr(chat_input_box, 'text'):
+            question_text = chat_input_box.text
+        else:
+            question_text = str(chat_input_box)
+        
+        add_message_to_current_study("user", question_text)
+        with st.chat_message("user"):
+            st.markdown(question_text)
+            
+        conversation_mode = st.session_state.get('conversation_mode', 'normal')
+        if conversation_mode != 'normal':
+            from tools.llm_tools import handle_conversation_context
+            response = handle_conversation_context(question_text)
+            with st.chat_message("assistant"):
+                st.markdown(response)
+            add_message_to_current_study(None, response)
+            st.rerun()
+            return
+        
+        available_studies = DatabaseConnection.list_available_studies()
+        
+        study_found = None
+        for study in available_studies:
+            if study.lower() in question_text.lower():
+                study_found = study
+                break
+        
+        if study_found:
+            switch_success = switch_study_and_reset_chat(study_found)
+            
+            if switch_success:
+                st.session_state.show_welcome_screen = False
+                response = f"✅ **Switched to study: {study_found}**\n\nPerfect! You can now query your data. What would you like to analyze?"
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            else:
+                response = f"❌ **Failed to switch to study: {study_found}**\n\nThere was an error switching to that study. Please try again or select a different study."
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(question_text, response)
+                st.rerun()
+                return
+        
+        try:
+            if any(phrase in question_text.lower() for phrase in ["new study", "create study", "start study", "make study"]):
+                st.session_state.show_welcome_screen = False
+                st.session_state.workflow_step = 'create_study_name'
+                st.session_state.selected_study_for_switch = None
+                st.session_state.show_study_selector = False
+                st.session_state.pending_deletion = None
+                
+                response = "🎯 **Great! Let's create a new study.**\n\nFirst, please provide a name for your new study:"
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            
+            elif any(phrase in question_text.lower() for phrase in ["delete study", "remove study", "delete ", "remove "]):
+                available_studies = DatabaseConnection.list_available_studies()
+                if not available_studies:
+                    response = "❌ **No studies available to delete.**\n\nYou don't have any studies yet. Would you like to create a new study instead?"
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+                
+                # Check if a specific study is mentioned
+                study_to_delete = None
+                for study in available_studies:
+                    if study.lower() in question_text.lower():
+                        study_to_delete = study
+                        break
+                
+                if study_to_delete:
+                    if study_to_delete == PROTECTED_STUDY:
+                        response = f"🔒 **Cannot Delete Example Study**\n\nThe study **'{PROTECTED_STUDY}'** is a protected example study and cannot be deleted. You can:\n- Deactivate it to work with other studies\n- Create a new study\n- Switch to a different study"
+                        with st.chat_message("assistant"):
+                            st.markdown(response)
+                        add_message_to_current_study(None, response)
+                        st.rerun()
+                        return
+
+                    response = f"⚠️ **DELETE STUDY CONFIRMATION**\n\nAre you sure you want to delete the study **'{study_to_delete}'**?\n\nThis action cannot be undone. Type **'{study_to_delete.lower()}'** to confirm deletion, or **'cancel'** to abort."
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    
+                    # Set state for deletion confirmation
+                    st.session_state.pending_deletion = study_to_delete
+                    st.rerun()
+                    return
+                else:
+                    studies_list = "\n".join([f"• {study} {'🔒 (Protected)' if study == PROTECTED_STUDY else ''}" for study in available_studies])
+                    response = f"🗑️ **Which study would you like to delete?**\n\nAvailable studies:\n{studies_list}\n\nPlease specify the study name you want to delete."
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+            
+            elif hasattr(st.session_state, 'pending_deletion') and st.session_state.pending_deletion:
+                pending_study = st.session_state.pending_deletion
+                
+                if question_text.lower() == 'cancel':
+                    st.session_state.pending_deletion = None
+                    response = "✅ **Deletion cancelled.**\n\nThe study was not deleted. Is there anything else I can help you with?"
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+                
+                elif question_text.lower() == pending_study.lower():
+                    if pending_study == PROTECTED_STUDY:
+                        st.session_state.pending_deletion = None
+                        response = f"🔒 **Cannot Delete Example Study**\n\nThe study **'{PROTECTED_STUDY}'** is a protected example study and cannot be deleted."
+                        with st.chat_message("assistant"):
+                            st.markdown(response)
+                        add_message_to_current_study(None, response)
+                        st.rerun()
+                        return
+
+                    with st.chat_message("assistant"):
+                        st.markdown(f"🔥 **Attempting to delete study '{pending_study}'...**")
+                    
+                    try:
+                        if delete_study_and_cleanup(pending_study):
+                            st.session_state.pending_deletion = None
+                            response = f"✅ **Study '{pending_study}' has been successfully deleted.**\n\nAll associated data has been removed. What would you like to do next?"
+                            with st.chat_message("assistant"):
+                                st.markdown(response)
+                            add_message_to_current_study(None, response)
+                        else:
+                            st.session_state.pending_deletion = None
+                            response = f"❌ **Failed to delete study '{pending_study}'.**\n\nThe study files could not be deleted. This could be due to:\n- File permission issues\n- Files currently in use\n- Database connections not fully closed\n\nPlease try again in a moment."
+                            with st.chat_message("assistant"):
+                                st.markdown(response)
+                            add_message_to_current_study(None, response)
+                        st.rerun()
+                        return
+                    except Exception as e:
+                        st.session_state.pending_deletion = None
+                        response = f"❌ **Error deleting study.**\n\nSorry, there was an error deleting '{pending_study}':\n```\n{str(e)}\n```\n\nPlease check the terminal for more details."
+                        with st.chat_message("assistant"):
+                            st.markdown(response)
+                        add_message_to_current_study(None, response)
+                        st.rerun()
+                        return
+                else:
+                    response = f"❌ **Invalid confirmation.**\n\nPlease type **'{pending_study.lower()}'** to confirm deletion, or **'cancel'** to abort."
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+            
+            elif any(phrase in question_text.lower() for phrase in ["list studies", "show studies", "available studies", "what studies"]):
+                available_studies = DatabaseConnection.list_available_studies()
+                if available_studies:
+                    studies_list = "\n".join([f"• {study} {'🔒 (Example)' if study == PROTECTED_STUDY else ''}" for study in available_studies])
+                    response = f"📚 **Available Studies:**\n\n{studies_list}\n\nYou can:\n- Say the study name to switch to it\n- Ask me to create a new study\n- Ask me to delete a study (except protected example study)"
+                else:
+                    response = "📚 **No studies available.**\n\nYou don't have any studies yet. Would you like to create your first study?"
+                
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            
+            available_studies = DatabaseConnection.list_available_studies()
+            context = {
+                "available_studies": available_studies,
+                "current_study": st.session_state.get('current_study'),
+                "capabilities": ["create new study", "switch to study", "delete study", "list studies", "upload data", "analyze data"]
+            }
+            llm_response = generate_conversational_response(question_text, context)
+            with st.chat_message("assistant"):
+                st.markdown(llm_response)
+            add_message_to_current_study(None, llm_response)
+            st.rerun()
+            return
+            
+        except Exception as e:
+            response = "I'm here to help! You can:\n- Select an existing study to work with\n- Create a new study\n- Ask me to list available studies\n\nWhat would you like to do?"
+            with st.chat_message("user"):
+                st.markdown(question_text)
+            with st.chat_message("assistant"):
+                st.markdown(response)
+            add_message_to_current_study(question_text, response)
+            st.rerun()
+            return
+
+def display_query_interface():
+    """Display the natural language query interface"""
+    st.subheader("Query Your Data")
+    
+    # Refresh tables list using current database connection
+    current_db = get_current_db_connection()
+    tables = current_db.list_tables()
+    tables_available = bool(tables)
+    
+    # Get database schema information for all tables
+    schema_info = []
+    valid_tables = []
+    if tables:
+        for table in tables:
+            schema = current_db.get_table_schema(table)
+            if schema:  # Only include tables with valid schema
+                schema_info.append(f"Table: {table}")
+                for col in schema:
+                    schema_info.append(f"  - {col['name']} ({col['type']})")
+                schema_info.append("")
+                valid_tables.append(table)
+    
+    tables_valid = bool(valid_tables)
+    
+    schema_text = "\n".join(schema_info)
+      # Multi-query approach is now the default and only option
+    # No checkbox needed as we're always using multi-query
+    
+    # Add custom CSS to style the chat input and download button
+    st.markdown("""
+    <style>
+    /* Custom styling for Load Study button */
+    .stButton > button[kind="primary"] {
+        background-color: #2E8B57 !important;
+        border-color: #2E8B57 !important;
+        color: white !important;
+    }
+    
+    .stButton > button[kind="primary"]:hover {
+        background-color: #228B22 !important;
+        border-color: #228B22 !important;
+        color: white !important;
+    }
+    
+    /* Style for chat input container to match the image */
+    .stChatInputContainer {
+        background-color: #14151B !important;
+        border-radius: 30px !important;
+        padding: 0px !important;
+        border: 1px solid #363946 !important;
+        /* Fix for scroll positioning issue */
+        position: fixed !important;
+        bottom: 1rem !important;
+        left: 1rem !important;
+        right: 1rem !important;
+        z-index: 999 !important;
+        min-height: 60px !important;
+        max-height: 200px !important;
+    }
+    
+    /* Style for the chat input itself */
+    .stChatInputContainer .stChatInput {
+        background-color: transparent !important;
+        color: #FFFFFF !important;
+        padding-left: 15px !important;
+        /* Fix for textarea height */
+        min-height: 40px !important;
+        height: auto !important;
+    }
+    
+    /* Fix for the textarea element specifically */
+    .stChatInputContainer textarea {
+        min-height: 40px !important;
+        height: auto !important;
+        resize: vertical !important;
+        max-height: 150px !important;
+    }
+    
+    /* Style for the send button */
+    .stChatInputContainer .stChatButton {
+        background-color: transparent !important;
+        color: #FFFFFF !important;
+    }
+    
+    /* Style for the file upload icon */
+    .stChatInputContainer .stChatFileUploadIcon {
+        color: #A3A3A3 !important;
+    }
+    
+    /* Adjust the overall container padding */
+    section[data-testid="stSidebar"] > div {
+        padding-top: 0rem;
+    }
+    
+    /* Overall background color to match dark theme */
+    .main .block-container {
+        background-color: #14151B;
+        /* Add bottom padding to prevent content from being hidden behind fixed chat input */
+        padding-bottom: 120px !important;
+    }
+    
+    /* Style for the download button */
+    .download-btn {
+        font-size: 24px;
+        cursor: pointer;
+        margin-left: 10px;
+        vertical-align: middle;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Add chat interface styling
+    st.markdown("""
+        <style>
+        /* Message containers */
+        .chat-message {
+            padding: 1.5rem;
+            margin: 1rem 0;
+            border-radius: 0.5rem;
+            display: flex;
+            align-items: flex-start;
+            background-color: #1E1F25;
+        }
+        
+        .user-message {
+            border: 1px solid #363946;
+        }
+        
+        .assistant-message {
+            border: 1px solid #4A4B53;
+        }
+        
+        /* Icons */
+        .message-icon {
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 1rem;
+            flex-shrink: 0;
+        }
+        
+        .user-icon {
+            background-color: #F47174;
+        }
+        
+        .assistant-icon {
+            background-color: #FFB347;
+        }
+        
+        /* Message content */
+        .message-content {
+            flex-grow: 1;
+        }
+        
+        .thinking {
+            color: #8E8EA0;
+            font-style: italic;
+        }
+        
+        /* Code blocks */
+        .sql-code {
+            background-color: #2B2D3A;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            margin: 0.5rem 0;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # Helper function to render messages
+    def render_message(content, is_user=False):
+        message_type = "user" if is_user else "assistant"
+        icon = "📊" if is_user else "📋"
+        icon_class = "user-icon" if is_user else "assistant-icon"
+        
+        st.markdown(f"""
+            <div class="chat-message {message_type}-message">
+                <div class="message-icon {icon_class}">{icon}</div>
+                <div class="message-content">{content}</div>
+            </div>
+        """, unsafe_allow_html=True)
+    
+    # Display chat history only once at the beginning
+    for idx, (role, message) in enumerate(st.session_state.chat_history):
+        with st.chat_message("assistant" if role is None else role):
+            if isinstance(message, tuple):
+                file_obj, media_tag = message
+                ext = os.path.splitext(file_obj)[-1].lower()
+                if ext in [".png", ".jpg", ".jpeg"]:
+                    st.image(file_obj)
+                else:
+                    st.markdown(f"🔎 File: `{os.path.basename(file_obj)}`")            
+            elif isinstance(message, dict) and message.get('type') == 'dataframe':
+                st.dataframe(apply_column_mapping(message['data']))
+            elif isinstance(message, dict) and message.get('type') == 'protocol_summary':
+                with st.container():
+                    col1, col2 = st.columns([0.95, 0.05])
+                    with col1:
+                        st.markdown("**Data Summary:**")
+                    with col2:
+                        if st.button("📥", key=message['button_key'], help="Download Protocol Summary as PDF"):
+                            pdf_buffer = generate_pdf_content(message['summary'])
+                            st.download_button(
+                                label="Download PDF",
+                                data=pdf_buffer,
+                                file_name="protocol_summary.pdf",
+                                mime="application/pdf",
+                                key=f"download_pdf_{message['button_key']}"
+                            )
+                    st.markdown(message['summary'])
+            elif isinstance(message, dict) and message.get('type') == 'sql_queries_expander':
+                # Display SQL queries in a collapsible expander
+                with st.expander("Generated SQL Query", expanded=False):
+                    for i, query in enumerate(message['queries']):
+                        st.markdown(f"**Query {i+1}:**")
+                        st.code(query, language="sql")
+            elif isinstance(message, dict) and message.get('type') == 'viz':
+                st.markdown(message['desc'])
+                st.plotly_chart(message['fig'], use_container_width=True, key=f"plotly_chart_{idx}")
+            else:
+                st.markdown(message)
+
+    # Display active workflow widgets (persistent across reruns)
+    if st.session_state.workflow_step:
+        st.markdown("---")
+        if st.session_state.workflow_step == 'create_study_name':
+            with st.container():
+                st.markdown("**🔬 Create New Study**")
+                render_study_name_input()
+        elif st.session_state.workflow_step == 'upload_protocol':
+            with st.container():
+                st.markdown("**📄 Upload Protocol File**")
+                st.markdown("Upload your PDF protocol document below:")
+                render_protocol_uploader()
+        elif st.session_state.workflow_step == 'upload_data':
+            with st.container():
+                st.markdown("**📊 Upload Data Files**")
+                st.markdown("Upload your CSV or Excel data files below:")
+                render_data_uploader()
+        elif st.session_state.workflow_step == 'file_upload':
+            with st.container():
+                st.markdown("**📁 Upload Files**")
+                st.markdown("Upload your files below:")
+                render_file_uploader()
+
+    # Direct chat input handling
+    chat_input_box = st.chat_input(
+        "Type your message here and/or upload a file...",
+        accept_file=True
+    )
+
+    # Initialize question variables
+    question_text = ""
+    uploaded_files = []
+
+    # Process selected example questions first
+    if st.session_state.selected_question:
+        question_text = st.session_state.selected_question
+        st.session_state.selected_question = ""
+    # Then handle chat input if present
+    elif chat_input_box:
+        if hasattr(chat_input_box, 'text'):
+            question_text = chat_input_box.text
+            if hasattr(chat_input_box, 'files'):
+                uploaded_files = chat_input_box.files
+        else:
+            question_text = chat_input_box
+
+    # Process the question immediately if we have one
+    if question_text:
+        # Skip welcome screen processing as it's handled in display_welcome_screen()
+        if st.session_state.show_welcome_screen:
+            return
+            
+        # Regular command processing
+        question_lower = question_text.lower().strip()
+        
+        # Detect if this is a new command that should clear previous interfaces
+        is_new_command = any([
+            any(phrase in question_lower for phrase in ['hey create me a new study', 'new study', 'make study', 'create me a study', 'create a new study', 'create study','switch study']),
+            any(phrase in question_lower for phrase in ['list studies', 'show studies', 'available studies', 'list all studies', 'all studies','list study']),
+            any(phrase in question_lower for phrase in ['upload data', 'upload file', 'upload csv', 'upload excel', 'add file', 'upload data file', 'i want to upload', 'want to upload', 'upload new data', 'i want to add data']),
+            any(phrase in question_lower for phrase in ['upload protocol', 'add protocol', 'protocol file', 'upload pdf'])
+        ])
+        
+        # Define command types for better state management
+        is_study_list_command = any(phrase in question_lower for phrase in ['list studies', 'show studies', 'available studies', 'list all studies', 'all studies','list study','switch study'])
+        is_upload_command = any(phrase in question_lower for phrase in ['upload data', 'upload file', 'upload csv', 'upload excel', 'add file', 'upload data file', 'i want to upload', 'i want to add data', 'upload new data', 'new data', 'upload protocol', 'add protocol'])
+        is_study_creation_command = any(phrase in question_lower for phrase in ['new study', 'make study', 'create study', 'create a new study'])
+        
+        # If it's a new command, clear existing states appropriately IMMEDIATELY
+        if is_new_command:
+            # Always clear workflow step for any new command
+            st.session_state.workflow_step = None
+            
+            # Clear study selector for non-study-list commands
+            if not is_study_list_command:
+                st.session_state.show_study_selector = False
+                st.session_state.last_study_list_question = None
+                st.session_state.selected_study_for_switch = None
+            
+            # Clear upload states for non-upload commands  
+            if not is_upload_command:
+                if 'pending_files' in st.session_state:
+                    st.session_state.pending_files = []
+                if 'pending_protocol_file' in st.session_state:
+                    st.session_state.pending_protocol_file = None
+        
+        # Check for cancel command (highest priority)
+        if question_lower in ['cancel', 'cancle', 'stop', 'abort', 'quit', 'exit']:
+            # Clear all workflow and selector states
+            st.session_state.workflow_step = None
+            st.session_state.show_study_selector = False
+            st.session_state.last_study_list_question = None
+            st.session_state.selected_study_for_switch = None
+            st.session_state.conversation_mode = 'normal'
+            st.session_state.pending_action = None
+            
+            # Clear any pending file states
+            if 'pending_files' in st.session_state:
+                st.session_state.pending_files = []
+            if 'pending_protocol_file' in st.session_state:
+                st.session_state.pending_protocol_file = None
+            
+            # Add cancel message to chat
+            add_message_to_current_study("user", question_text)
+            with st.chat_message("user"):
+                st.markdown(question_text)
+            
+            cancel_response = "✅ **Operation cancelled.** Returning to normal query mode. How can I help you analyze your data?"
+            with st.chat_message("assistant"):
+                st.markdown(cancel_response)
+            add_message_to_current_study(None, cancel_response)
+            st.rerun()
+            return
+        
+        # Check if we're in a workflow step (after potential clearing)
+        if st.session_state.workflow_step and not is_new_command:
+            handle_workflow_steps(question_text)
+            return
+        
+        # HIGHEST PRIORITY: Check for deletion confirmation BEFORE conversation context
+        if hasattr(st.session_state, 'pending_deletion') and st.session_state.pending_deletion:
+            # Add user message first
+            add_message_to_current_study("user", question_text)
+            with st.chat_message("user"):
+                st.markdown(question_text)
+            
+            pending_study = st.session_state.pending_deletion
+            
+            if question_text.lower() == 'cancel':
+                st.session_state.pending_deletion = None
+                response = "✅ **Deletion cancelled.**\n\nThe study was not deleted. Is there anything else I can help you with?"
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            
+            elif question_text.lower() == pending_study.lower():
+                if pending_study == PROTECTED_STUDY:
+                    st.session_state.pending_deletion = None
+                    response = f"🔒 **Cannot Delete Example Study**\n\nThe study **'{PROTECTED_STUDY}'** is a protected example study and cannot be deleted."
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+
+                with st.chat_message("assistant"):
+                    st.markdown(f"🔥 **Attempting to delete study '{pending_study}'...**")
+                
+                try:
+                    if delete_study_and_cleanup(pending_study):
+                        st.session_state.pending_deletion = None
+                        response = f"✅ **Study '{pending_study}' has been successfully deleted.**\n\nAll associated data has been removed. What would you like to do next?"
+                        with st.chat_message("assistant"):
+                            st.markdown(response)
+                        add_message_to_current_study(None, response)
+                    else:
+                        st.session_state.pending_deletion = None
+                        response = f"❌ **Failed to delete study '{pending_study}'.**\n\nThe study files could not be deleted. This could be due to:\n- File permission issues\n- Files currently in use\n- Database connections not fully closed\n\nPlease try again in a moment."
+                        with st.chat_message("assistant"):
+                            st.markdown(response)
+                        add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+                except Exception as e:
+                    st.session_state.pending_deletion = None
+                    response = f"❌ **Error deleting study.**\n\nSorry, there was an error deleting '{pending_study}':\n```\n{str(e)}\n```\n\nPlease check the terminal for more details."
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+            else:
+                response = f"❌ **Invalid confirmation.**\n\nPlease type **'{pending_study.lower()}'** to confirm deletion, or **'cancel'** to abort."
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+        
+        # CHECK: If we're awaiting deletion selection (user said "delete study" without specifying which one)
+        elif hasattr(st.session_state, 'awaiting_deletion_selection') and st.session_state.awaiting_deletion_selection:
+            # Add user message first
+            add_message_to_current_study("user", question_text)
+            with st.chat_message("user"):
+                st.markdown(question_text)
+            
+            # Clear the awaiting state
+            st.session_state.awaiting_deletion_selection = False
+            
+            if question_text.lower() == 'cancel':
+                response = "✅ **Deletion cancelled.**\n\nNo study was deleted. Is there anything else I can help you with?"
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            
+            # Check if the user typed a valid study name
+            available_studies = DatabaseConnection.list_available_studies()
+            study_to_delete = None
+            
+            # Look for exact match first
+            for study in available_studies:
+                if question_text.lower() == study.lower():
+                    study_to_delete = study
+                    break
+            
+            # If no exact match, look for partial match
+            if not study_to_delete:
+                for study in available_studies:
+                    if study.lower() in question_text.lower():
+                        study_to_delete = study
+                        break
+            
+            if study_to_delete:
+                if study_to_delete == PROTECTED_STUDY:
+                    response = f"🔒 **Cannot Delete Example Study**\n\nThe study **'{PROTECTED_STUDY}'** is a protected example study and cannot be deleted. You can:\n- Deactivate it to work with other studies\n- Create a new study\n- Switch to a different study"
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+
+                response = f"⚠️ **DELETE STUDY CONFIRMATION**\n\nAre you sure you want to delete the study **'{study_to_delete}'**?\n\nThis action cannot be undone. Type **'{study_to_delete.lower()}'** to confirm deletion, or **'cancel'** to abort."
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                
+                # Set state for deletion confirmation
+                st.session_state.pending_deletion = study_to_delete
+                st.rerun()
+                return
+            else:
+                studies_list = "\n".join([f"• {study} {'🔒 (Protected)' if study == PROTECTED_STUDY else ''}" for study in available_studies])
+                response = f"❌ **Study '{question_text}' not found.**\n\nAvailable studies:\n{studies_list}\n\nPlease specify a valid study name or type 'cancel' to abort."
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                
+                # Reset the awaiting state so user can try again
+                st.session_state.awaiting_deletion_selection = True
+                st.rerun()
+                return
+        
+        # Then check if we're in a special conversation mode
+        context_response = handle_conversation_context(question_text)
+        if context_response:
+            # We're in a multi-step conversation, handle it
+            add_message_to_current_study("user", question_text)
+            with st.chat_message("user"):
+                st.markdown(question_text)
+            
+            with st.chat_message("assistant"):
+                st.markdown(context_response)
+            add_message_to_current_study(None, context_response)
+            st.rerun()
+            return
+
+        # Detect intent for the user message
+        try:
+            # Manual fallback detection FIRST (before LLM intent detection)
+            question_lower = question_text.lower()
+            is_study_creation = any(phrase in question_lower for phrase in [
+                'create study', 'new study', 'make study', 'create me a study', 'create a new study'
+            ])
+            is_study_list = any(phrase in question_lower for phrase in [
+                'list studies', 'show studies', 'available studies', 'all studies'
+            ])
+            is_file_upload = any(phrase in question_lower for phrase in [
+                'upload file', 'upload data', 'upload csv', 'upload excel', 'add file', 'upload data file', 'i want to upload', 'want to upload', 'upload new data', 'new data'
+            ])
+            is_protocol_upload = any(phrase in question_lower for phrase in [
+                'upload protocol', 'add protocol', 'protocol file', 'upload pdf'
+            ])
+            
+            # If manual detection finds a match, handle it immediately
+            if is_study_creation:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                # Start study creation workflow
+                st.session_state.workflow_step = 'create_study_name'
+                response = "I'll help you create a new study! Please enter your new study name below:"
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            
+            elif is_study_list:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                # Set session state flag to persist study selector across reruns
+                st.session_state.show_study_selector = True
+                st.session_state.last_study_list_question = question_text
+                st.rerun()
+                return
+            
+            elif is_file_upload:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                # Handle file upload workflow
+                st.session_state.workflow_step = 'file_upload'
+                with st.chat_message("assistant"):
+                    st.markdown("Perfect! I'll help you upload files to your study. The file upload interface will appear below this chat.")
+                add_message_to_current_study(None, "Perfect! I'll help you upload files to your study. The file upload interface will appear below this chat.")
+                st.rerun()
+                return
+            
+            elif is_protocol_upload:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                # Handle protocol upload workflow
+                st.session_state.workflow_step = 'upload_protocol'
+                with st.chat_message("assistant"):
+                    st.markdown("I'll help you upload a protocol file. Please use the protocol uploader below:")
+                add_message_to_current_study(None, "I'll help you upload a protocol file. Please use the protocol uploader below:")
+                st.rerun()
+                return
+            
+            # Check for study management commands (add support to query interface)
+            is_study_list = any(phrase in question_lower for phrase in [
+                'list study','list studies', 'show studies', 'available studies','show study', 'all studies'
+            ])
+            is_study_creation = any(phrase in question_lower for phrase in [
+                'create study', 'new study', 'make study', 'create me a study', 'create a new study'
+            ])
+            
+            if is_study_list:
+                # Add user message first
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                # Handle study list in query interface
+                available_studies = DatabaseConnection.list_available_studies()
+                if available_studies:
+                    studies_list = "\n".join([f"• {study} {'🔒 (Example)' if study == PROTECTED_STUDY else ''}" for study in available_studies])
+                    response = f"📚 **Available Studies:**\n\n{studies_list}\n\nYou can:\n- Say the study name to switch to it\n- Ask me to create a new study\n- Ask me to delete a study (except protected example study)"
+                else:
+                    response = "📚 **No studies available.**\n\nYou don't have any studies yet. Would you like to create your first study?"
+                
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            
+            elif is_study_creation:
+                # Add user message first
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                # Start study creation workflow in query interface
+                st.session_state.workflow_step = 'create_study_name'
+                response = "🎯 **Let's create a new study!**\n\nThe study name input will appear below this chat. Please enter a descriptive name for your new study."
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            
+            # Check for study deletion commands (add support to query interface)
+            is_study_deletion = any(phrase in question_lower for phrase in [
+                'delete study', 'remove study', 'delete ', 'remove '
+            ])
+            
+            if is_study_deletion:
+                # Add user message first
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                # Handle study deletion in query interface
+                available_studies = DatabaseConnection.list_available_studies()
+                if not available_studies:
+                    response = "❌ **No studies available to delete.**\n\nYou don't have any studies yet. Would you like to create a new study instead?"
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    st.rerun()
+                    return
+                
+                # Check if a specific study is mentioned
+                study_to_delete = None
+                for study in available_studies:
+                    if study.lower() in question_text.lower():
+                        study_to_delete = study
+                        break
+                
+                if study_to_delete:
+                    if study_to_delete == PROTECTED_STUDY:
+                        response = f"🔒 **Cannot Delete Example Study**\n\nThe study **'{PROTECTED_STUDY}'** is a protected example study and cannot be deleted. You can:\n- Deactivate it to work with other studies\n- Create a new study\n- Switch to a different study"
+                        with st.chat_message("assistant"):
+                            st.markdown(response)
+                        add_message_to_current_study(None, response)
+                        st.rerun()
+                        return
+
+                    response = f"⚠️ **DELETE STUDY CONFIRMATION**\n\nAre you sure you want to delete the study **'{study_to_delete}'**?\n\nThis action cannot be undone. Type **'{study_to_delete.lower()}'** to confirm deletion, or **'cancel'** to abort."
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    
+                    # Set state for deletion confirmation
+                    st.session_state.pending_deletion = study_to_delete
+                    st.rerun()
+                    return
+                else:
+                    studies_list = "\n".join([f"• {study} {'🔒 (Protected)' if study == PROTECTED_STUDY else ''}" for study in available_studies])
+                    response = f"🗑️ **Which study would you like to delete?**\n\nAvailable studies:\n{studies_list}\n\nPlease specify the study name you want to delete."
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                    add_message_to_current_study(None, response)
+                    
+                    # Set state to indicate we're waiting for study selection for deletion
+                    st.session_state.awaiting_deletion_selection = True
+                    st.rerun()
+                    return
+            
+            # Check if this is a deletion confirmation (REMOVED - handled at top of function)
+            # This check has been moved to the beginning of input processing for proper priority
+            
+            # If no manual match, try LLM intent detection
+            intent_data = detect_chat_intent(question_text)
+            st.session_state.last_intent = intent_data
+            
+            intent = intent_data.get('intent', 'chat')
+            confidence = intent_data.get('confidence', 0.0)
+            
+            # Route based on detected intent (as backup to manual detection)
+            if intent == 'study_management' and confidence > 0.7:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                response = handle_chat_study_management(intent_data)
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+            
+            # Manual fallback for file upload commands
+            is_file_upload = any(phrase in question_lower for phrase in [
+                'upload file', 'upload data', 'upload csv', 'upload excel', 'add file'
+            ])
+                
+            if intent == 'file_upload' and confidence > 0.7:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                # Handle file upload workflow
+                st.session_state.workflow_step = 'file_upload'
+                with st.chat_message("assistant"):
+                    st.markdown("Perfect! I'll help you upload files to your study. The file upload interface will appear below this chat.")
+                add_message_to_current_study(None, "Perfect! I'll help you upload files to your study. The file upload interface will appear below this chat.")
+                st.rerun()
+                return
+                
+            elif intent == 'settings' and confidence > 0.7:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                response = "I can help you with application settings. Currently available settings include study management and data upload preferences. What specific setting would you like to change?"
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+                
+            elif intent == 'help' and confidence > 0.7:
+                add_message_to_current_study("user", question_text)
+                with st.chat_message("user"):
+                    st.markdown(question_text)
+                
+                response = """I can help you with:
+• **Data Queries**: Ask me to analyze your data, create visualizations, or run SQL queries
+• **Study Management**: Create new studies, switch between studies, or list available studies  
+• **File Upload**: Upload CSV/Excel data files or PDF protocol documents
+• **Settings**: Configure application preferences
+
+Try asking: "Show me all patients" or "Create a new study called Trial123" or "Upload data file"
+
+What would you like to do?"""
+                with st.chat_message("assistant"):
+                    st.markdown(response)
+                add_message_to_current_study(None, response)
+                st.rerun()
+                return
+                
+        except Exception as e:
+            # Fallback to original behavior if intent detection fails
+            print(f"Intent detection error: {e}")
+        
+        # Default to data query processing for data queries or when intent detection fails
+        # Add user question to history and render it immediately
+        add_message_to_current_study("user", question_text)
+        with st.chat_message("user"):
+            st.markdown(question_text)
+
+        # Check if we have valid tables for data queries
+        if not tables_valid:
+            # No tables available - provide helpful response
+            try:
+                from tools.llm_tools import generate_conversational_response
+                # Create context for conversation
+                context = {
+                    'current_study': st.session_state.current_study,
+                    'has_data': False,
+                    'available_studies': DatabaseConnection.list_available_studies()
+                }
+                conversation_response = generate_conversational_response(context, question_text)
+                with st.chat_message("assistant"):
+                    st.markdown(conversation_response)
+                add_message_to_current_study(None, conversation_response)
+                st.rerun()
+                return
+            except Exception as e:
+                # Fallback response when LLM fails
+                no_data_response = "I'd love to help you analyze your data! However, I don't see any data tables uploaded yet. Please upload your CSV or Excel files to get started with data analysis.\n\nI can also help you:\n- Create a new study\n- Upload protocol files\n- Switch between studies\n\nWhat would you like to do?"
+                with st.chat_message("assistant"):
+                    st.markdown(no_data_response)
+                add_message_to_current_study(None, no_data_response)
+                st.rerun()
+                return
+
+        # Create a placeholder for the assistant's response
+        with st.chat_message("assistant"):
+            message_box = st.empty()
+            message_box.markdown("🤔 Thinking...")
+          # Process the query and collect all responses in a list
+        response_messages = []
+        
+        try:
+            if USE_SINGLE_QUERY:
+                # Single query mode
+                with st.spinner("Generating SQL query..."):
+                    from tools.llm_tools import execute_query, generate_protocol_summary
+                    # Generate single SQL query
+                    sql_query = st.session_state.sql_generator.generate_sql(schema_text, question_text)
+                
+                # Store the SQL query to be displayed in an expander when rendering the message
+                sql_queries_for_expander = {
+                    "type": "sql_queries_expander",
+                    "queries": [sql_query]  # Wrap in list for consistent display
+                }
+                response_messages.append(sql_queries_for_expander)
+                
+                with st.spinner("Executing query..."):
+                    # Execute single query using db_utils module
+                    result_df = db.execute_single_query(sql_query)
+                
+                # Generate protocol summary for single result
+                try:
+                    with st.spinner("Generating protocol-based summary..."):
+                        protocol_summary = generate_protocol_summary(result_df, st.session_state.current_study)
+                        # Add protocol summary to chat history with unique key
+                        protocol_message = {
+                            'type': 'protocol_summary',
+                            'summary': protocol_summary,
+                            'button_key': f"download_single_query_{question_text}_{len(st.session_state.chat_history)}"
+                        }
+                        response_messages.append(protocol_message)
+                except Exception as e:
+                    response_messages.append(f"Error generating protocol summary: {str(e)}")
+                
+                # Convert single result to multi-query format for consistent processing
+                results_dict = {"query_1": result_df}
+                
+            else:
+                # Multi-query mode (original functionality)
+                with st.spinner("Generating multiple SQL queries..."):
+                    # Import necessary functions
+                    from tools.llm_tools import execute_multi_query                    # Generate multiple SQL queries
+                    sql_queries = st.session_state.sql_generator.generate_multi_sql(schema_text, question_text)            
+                # Store the SQL queries to be displayed in an expander when rendering the message
+                sql_queries_for_expander = {
+                    "type": "sql_queries_expander",
+                    "queries": sql_queries
+                }
+                response_messages.append(sql_queries_for_expander)
+                
+                with st.spinner("Executing queries..."):
+                    # Execute queries using db_utils module
+                    with db.get_connection() as conn:
+                        results_dict = execute_multi_query(conn, sql_queries)
+                
+                # Generate protocol summary before results
+                try:
+                    with st.spinner("Generating protocol-based summary..."):
+                        from tools.llm_tools import generate_multi_query_protocol_summary
+                        protocol_summary = generate_multi_query_protocol_summary(results_dict, st.session_state.current_study)
+                        # Add protocol summary to chat history with unique key
+                        protocol_message = {
+                            'type': 'protocol_summary',
+                            'summary': protocol_summary,
+                            'button_key': f"download_multi_query_{question_text}_{len(st.session_state.chat_history)}"
+                        }
+                        response_messages.append(protocol_message)
+                except Exception as e:
+                    response_messages.append(f"Error generating protocol summary: {str(e)}")
+            
+            # Process and store results
+            if "errors" in results_dict:
+                response_messages.append("Some queries encountered errors:\n")
+                response_messages.append({"type": "dataframe", "data": results_dict["errors"]})
+            
+            # Process results
+            has_results = False
+            non_empty_dfs = []
+            for key, df in results_dict.items():
+                if key != "errors" and not df.empty:
+                    has_results = True
+                    non_empty_dfs.append(df)
+                    response_messages.append({"type": "dataframe", "data": df})
+
+            if not has_results:
+                response_messages.append("The query returned no results.")
+
+            # Only create visualizations if the user explicitly asks for it
+            if should_show_visualization(question_text) and non_empty_dfs:
+                try:
+                    # Import visualization functions here to ensure they're in scope
+                    from tools.llm_tools import generate_visualization_code, execute_visualization_code
+                    
+                    # Use the first non-empty DataFrame for visualization
+                    viz_df = non_empty_dfs[0]
+                    
+                    # Add a note if there are multiple DataFrames
+                    if len(non_empty_dfs) > 1:
+                        response_messages.append(f"📊 **Note:** Showing visualization for the first dataset. Found {len(non_empty_dfs)} datasets total.")
+                    
+                    # Use LLM-based visualization generation
+                    viz_result = generate_visualization_code(viz_df, question_text)
+                    
+                    if viz_result["error"]:
+                        response_messages.append(f"Could not generate visualization: {viz_result['error']}")
+                    elif viz_result["code"]:
+                        # Execute the generated code
+                        exec_result = execute_visualization_code(viz_result["code"], viz_df)
+                        
+                        if exec_result["error"]:
+                            response_messages.append(f"Could not execute visualization: {exec_result['error']}")
+                        elif exec_result["fig"]:
+                            response_messages.append({
+                                "type": "viz", 
+                                "fig": exec_result["fig"], 
+                                "desc": f"**Smart Visualization:** {viz_result['description']}"
+                            })
+                        else:
+                            response_messages.append("Visualization code executed but no figure was generated.")
+                    else:
+                        response_messages.append("No visualization code was generated.")
+                        
+                except Exception as e:
+                    response_messages.append(f"Could not create visualization: {str(e)}")
+            
+            # Automatic visualization suggestions have been disabled
+            # Users can still manually request visualizations        
+        except Exception as e:
+            response_messages.append("Error processing query")
+            response_messages.append(f"**Error Details:**\n```\n{str(e)}\n```")          # Update the placeholder with the final response and add to chat history
+        message_box.empty()
+        for message in response_messages:
+            with st.chat_message("assistant"):
+                if isinstance(message, dict) and message.get('type') == 'dataframe':
+                    st.dataframe(apply_column_mapping(message['data']))
+                    add_message_to_current_study("assistant", message)
+                elif isinstance(message, dict) and message.get('type') == 'protocol_summary':
+                    with st.container():
+                        col1, col2 = st.columns([0.95, 0.05])
+                        with col1:
+                            st.markdown("**Data Summary:**")
+                        with col2:
+                            if st.button("📥", key=message['button_key'], help="Download Protocol Summary as PDF"):
+                                pdf_buffer = generate_pdf_content(message['summary'])
+                                st.download_button(
+                                    label="Download PDF",
+                                    data=pdf_buffer,
+                                    file_name="protocol_summary.pdf",
+                                    mime="application/pdf",
+                                    key=f"download_pdf_{message['button_key']}"
+                                )
+                        st.markdown(message['summary'])
+                    add_message_to_current_study("assistant", message)
+                elif isinstance(message, dict) and message.get('type') == 'sql_queries_expander':
+                    # Display SQL queries in a collapsible expander
+                    with st.expander("Generated SQL Query", expanded=False):
+                        for i, query in enumerate(message['queries']):
+                            st.markdown(f"**Query {i+1}:**")
+                            st.code(query, language="sql")
+                    add_message_to_current_study("assistant", message)
+                elif isinstance(message, dict) and message.get('type') == 'viz':
+                    st.markdown(message['desc'])
+                    st.plotly_chart(message['fig'], use_container_width=True)
+                    add_message_to_current_study("assistant", message)
+                else:
+                    st.markdown(message)
+                    add_message_to_current_study("assistant", message)
+
+    # Persist study selector interface if flag is set
+    if st.session_state.get('show_study_selector', False):
+        # Show the last question for context
+        if st.session_state.get('last_study_list_question'):
+            with st.chat_message("user"):
+                st.markdown(st.session_state['last_study_list_question'])
+        with st.chat_message("assistant"):
+            st.markdown("Here are your available studies:")
+            render_study_selector_checkboxes()
+
+def handle_query_response(results, is_multi_query=False):
+    """Handle query response without generating protocol summary"""
+    response_messages = []
+    
+    if is_multi_query:
+        if "errors" in results:
+            response_messages.append("Some queries encountered errors:\n")
+            response_messages.append({"type": "dataframe", "data": apply_column_mapping(results["errors"])})
+        
+        has_results = any(not df.empty for k, df in results.items() if k != "errors")
+        
+        if has_results:
+
+            for key, df in results.items():
+                if key != "errors" and not df.empty:
+                    response_messages.append({"type": "dataframe", "data": apply_column_mapping(df)})
+        else:
+            response_messages.append("The query returned no results.")
+    else:
+        if not results.empty:
+
+            response_messages.append("**Query Results:**")
+            response_messages.append({"type": "dataframe", "data": apply_column_mapping(results)})
+        else:
+            response_messages.append("The query returned no results.")
+    
+    return response_messages
+
+def display_thinking():
+    """Display thinking state with custom styling"""
+    thinking_html = """
+        <div style="
+            background-color: #1E1F25;
+            border-radius: 15px;
+            padding: 15px;
+            margin: 10px 0;
+            border: 1px solid #4A4B53;
+            display: flex;
+            align-items: flex-start;
+        ">
+            <div style="
+                background-color: #FFB347;
+                border-radius: 50%;
+                width: 32px;
+                height: 32px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin-right: 12px;
+                flex-shrink: 0;
+                color: white;
+            ">🤔</div>
+            <div style="flex-grow: 1; color: #8E8EA0; font-style: italic;">
+                Thinking...
+            </div>
+        </div>
+    """
+    return st.markdown(thinking_html, unsafe_allow_html=True)
+
+def chat_container(role="assistant"):
+    """Create a custom styled container for chat messages"""
+    # Define styles based on role
+    is_user = role == "user"
+    icon = "📊" if is_user else "📋"
+    bg_color = "#F47174" if is_user else "#FFB347"
+    border = "#363946" if is_user else "#4A4B53"
+    
+    container = st.container()
+    with container:
+        st.markdown(f"""
+            <div style="
+                background-color: #1E1F25;
+                border-radius: 15px;
+                padding: 15px;
+                margin: 10px 0;
+                border: 1px solid {border};
+                display: flex;
+                align-items: flex-start;
+            ">
+                <div style="
+                    background-color: {bg_color};
+                    border-radius: 50%;
+                    width: 32px;
+                    height: 32px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    margin-right: 12px;
+                    flex-shrink: 0;
+                    color: white;
+                ">{icon}</div>
+                <div style="flex-grow: 1;">
+            """, unsafe_allow_html=True)
+    return container
+
+def close_chat_container():
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+def process_new_message(query, file_info=""):
+    """Process a new message with intent detection and update chat history"""
+    
+    # First check if we're in a special conversation mode
+    context_response = handle_conversation_context(query)
+    if context_response:
+        # We're in a multi-step conversation, handle it
+        add_message("user", query)
+        add_message_to_current_study(None, context_response)
+        return None
+    
+    # Add user message to chat history
+    full_message = f"{query}{file_info}"
+    add_message("user", full_message)
+    
+    # Show thinking state
+    thinking_placeholder = st.empty()
+    with thinking_placeholder.container():
+        with st.chat_message("assistant"):
+            st.markdown("🤔 Thinking...")
+    
+    try:
+        # Detect intent for the user message
+        intent_data = detect_chat_intent(query)
+        st.session_state.last_intent = intent_data
+        
+        intent = intent_data.get('intent', 'chat')
+        confidence = intent_data.get('confidence', 0.0)
+        
+        # Route based on detected intent
+        if intent == 'study_management' and confidence > 0.7:
+            response = handle_chat_study_management(intent_data)
+            update_assistant_response(thinking_placeholder, response)
+            return thinking_placeholder
+            
+        elif intent == 'file_upload' and confidence > 0.7:
+            response = handle_chat_file_upload(intent_data)
+            update_assistant_response(thinking_placeholder, response)
+            return thinking_placeholder
+            
+        elif intent == 'settings' and confidence > 0.7:
+            response = "I can help you with application settings. Currently available settings include study management and data upload preferences. What specific setting would you like to change?"
+            update_assistant_response(thinking_placeholder, response)
+            return thinking_placeholder
+            
+        elif intent == 'help' and confidence > 0.7:
+            response = """I can help you with:
+• **Data Queries**: Ask me to analyze your data, create visualizations, or run SQL queries
+• **Study Management**: Create new studies, switch between studies, or list available studies  
+• **File Upload**: Upload CSV/Excel data files or PDF protocol documents
+• **Settings**: Configure application preferences
+
+Try asking: "Show me all patients" or "Create a new study called Trial123" or "Upload data file"
+
+What would you like to do?"""
+            update_assistant_response(thinking_placeholder, response)
+            return thinking_placeholder
+            
+        elif intent == 'data_query' or confidence < 0.7:
+            # Default to data query processing for high-confidence data queries or low-confidence messages
+            # This maintains the existing SQL generation workflow
+            return thinking_placeholder
+            
+        else:
+            # Handle other intents as general chat
+            response = f"I understand you want to {intent_data.get('explanation', 'chat')}. How can I help you with that?"
+            update_assistant_response(thinking_placeholder, response)
+            return thinking_placeholder
+            
+    except Exception as e:
+        # Fallback to original behavior if intent detection fails
+        print(f"Intent detection error: {e}")
+        return thinking_placeholder
+
+    return thinking_placeholder
+
+def update_assistant_response(placeholder, content, message_type="text"):
+    """Update assistant's response in chat history"""
+    # Remove thinking message if it exists
+    current_history = get_current_chat_history()
+    if len(current_history) > 0 and current_history[-1][1] == "Thinking...":
+        current_history.pop()
+        sync_chat_history()
+    
+    # Add the new response
+    if message_type == "dataframe":
+        add_message_to_current_study(None, {"type": "dataframe", "data": content})
+    elif message_type == "file":
+        add_message_to_current_study(None, (content, "Media"))
+    else:
+        add_message_to_current_study(None, content)
+    
+    # Clear the thinking placeholder
+    placeholder.empty()
+
+def download_chat_history():
+    """Download chat history as HTML file"""
+    try:
+        # Generate HTML content
+        html_content = """
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Chat History</title>
+            <style>
+                body { font-family: Arial, sans-serif; background-color: #14151B; color: #FFFFFF; margin: 0; padding: 0; }
+                .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+                h1 { text-align: center; color: #FFB347; }
+                .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+                .user { background-color: #F47174; }
+                .assistant { background-color: #4A4B53; }
+                pre { background-color: #2B2D3A; padding: 10px; border-radius: 5px; }
+                .widget-container { 
+                    background-color: #3A3B43; 
+                    border: 2px dashed #6C757D; 
+                    padding: 15px; 
+                    border-radius: 8px; 
+                    margin: 10px 0; 
+                    text-align: center; 
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Chat History</h1>
+        """        # Add each message to the HTML content
+        for role, content in st.session_state.chat_history:
+            if isinstance(content, tuple):
+                file_obj, media_tag = content
+                file_name = os.path.basename(file_obj)
+                html_content += f"""
+                    <div class="message {role}">
+                        <strong>{role.capitalize()}:</strong> <a href="{file_obj}" download>{file_name}</a>
+                    </div>
+                """
+            elif isinstance(content, dict) and content.get('type') == 'dataframe':
+                # Convert DataFrame to HTML table
+                df = content['data']
+                html_table = df.to_html(classes='dataframe', index=False)
+                html_content += f"""
+                    <div class="message {role}">
+                        <strong>{role.capitalize()}:</strong>
+                        <div>{html_table}</div>
+                    </div>
+                """
+            elif isinstance(content, dict) and content.get('type') == 'protocol_summary':
+                # Convert markdown to HTML
+                import markdown2
+                summary_html = markdown2.markdown(content['summary'])
+                html_content += f"""
+                    <div class="message {role}">
+                        <strong>{role.capitalize()}:</strong>
+                        <div>{summary_html}</div>
+                    </div>
+                """
+            else:
+                html_content += f"""
+                    <div class="message {role}">
+                        <strong>{role.capitalize()}:</strong> {content}
+                    </div>
+                """
+
+        html_content += """
+            </div>
+        </body>
+        </html>
+        """
+
+        # Write to a temporary HTML file
+        temp_file = os.path.join(os.getcwd(), "data", f"chat_history_{uuid.uuid4()}.html")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        # Provide download link
+        st.download_button(
+            label="Download Chat History",
+            data=temp_file,
+            file_name=os.path.basename(temp_file),
+            mime="text/html",
+            key="download_chat_history"
+        )
+    except Exception as e:
+        st.error(f"Error generating download link: {str(e)}")
+
+def generate_html_export():
+    """
+    Generate an HTML export of the entire chat history with styling.
+    """
+    # Generate a unique ID for this export
+    export_id = str(uuid.uuid4())[:8]
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
+    # HTML Header with styling
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Data Review Assistant - Chat Export ({current_time})</title>        <style>
+            body {{
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+                background-color: #14151B;
+                color: #FFFFFF;
+                padding: 20px;
+                margin: 0;
+                font-size: 14px;
+                line-height: 1.5;
+                font-weight: 400;
+            }}
+            .header {{
+                display: flex;
+                align-items: center;
+                margin-bottom: 20px;
+                border-bottom: 1px solid #363946;
+                padding-bottom: 10px;
+            }}            .header h1 {{
+                margin-left: 10px;
+                font-weight: 500;
+                font-size: 20px;
+            }}
+            .chat-container {{
+                max-width: 1200px;
+                margin: 0 auto;
+            }}            .chat-message {{
+                padding: 1.25rem;
+                margin: 0.75rem 0;
+                border-radius: 0.5rem;
+                display: flex;
+                align-items: flex-start;
+                background-color: #1E1F25;
+            }}
+            .user-message {{
+                border: 1px solid #363946;
+            }}
+            .assistant-message {{
+                border: 1px solid #4A4B53;
+            }}
+            .message-icon {{
+                width: 2.5rem;
+                height: 2.5rem;
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin-right: 1rem;
+                flex-shrink: 0;
+                color: white;
+                font-size: 1.2rem;
+                text-align: center;
+            }}
+            .user-icon {{
+                background-color: #F47174;
+            }}
+            .assistant-icon {{
+                background-color: #FFB347;
+            }}            .message-content {{
+                flex-grow: 1;
+                width: 100%;
+                overflow-x: hidden;
+                font-size: 14px;
+                font-weight: 400;
+                line-height: 1.5;
+                letter-spacing: 0.00938em;
+            }}            .sql-code {{
+                background-color: #2B2D3A;
+                padding: 0.75rem;
+                border-radius: 0.4rem;
+                margin: 0.5rem 0;
+                font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+                font-size: 13px;
+                line-height: 1.4;
+                white-space: pre-wrap;
+                overflow-x: auto;
+            }}table {{
+                border-collapse: collapse;
+                width: 100%;
+                margin: 1rem 0;
+                font-size: 13px;
+            }}
+            th, td {{
+                border: 1px solid #363946;
+                padding: 6px 10px;
+                text-align: left;
+                font-weight: 400;
+            }}
+            th {{
+                background-color: #2B2D3A;
+                font-weight: 500;
+            }}
+            /* Additional styling for dataframe tables */
+            .dataframe-table {{
+                min-width: 100%;
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            }}
+            tr:nth-child(even) {{
+                background-color: #1A1B21;
+            }}
+            .timestamp {{
+                font-size: 0.8rem;
+                color: #8E8EA0;
+                margin-top: 10px;
+                text-align: right;
+            }}            .protocol-summary {{
+                padding: 1rem;
+                background-color: #2B2D3A;
+                border-radius: 0.5rem;
+                margin: 1rem 0;
+                font-size: 14px;
+                line-height: 1.5;
+            }}            .protocol-title {{
+                font-weight: 500;
+                margin-bottom: 0.5rem;
+                font-size: 15px;
+            }}
+            .protocol-content {{
+                font-weight: 400;
+                line-height: 1.5;
+            }}
+            .protocol-content p {{
+                margin: 0.5rem 0;
+            }}
+            img {{
+                max-width: 100%;
+                border-radius: 0.5rem;
+                margin: 1rem 0;
+            }}            code {{
+                background-color: #2B2D3A;
+                padding: 0.15rem 0.3rem;
+                border-radius: 0.25rem;
+                font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+                font-size: 13px;
+            }}            
+            pre {{
+                background-color: #2B2D3A;
+                padding: 0.75rem;
+                border-radius: 0.4rem;
+                overflow-x: auto;
+                font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+                font-size: 13px;
+                line-height: 1.4;
+                white-space: pre-wrap;
+            }}.dataframe-container {{
+                width: 100%;
+                margin: 1rem 0;
+                border-radius: 0.5rem;
+                position: relative;
+                display: block;
+            }}
+            .table-wrapper {{
+                overflow-x: auto !important;
+                overflow-y: auto;
+                white-space: nowrap;
+                width: 100%;
+                display: block;
+                max-width: 100%;
+            }}
+            .dataframe-table {{
+                width: 100%;
+                border-collapse: collapse;
+                table-layout: auto;
+            }}            /* Fix for wide tables */
+            .dataframe-table td, .dataframe-table th {{
+                white-space: nowrap;
+            }}
+            
+            /* Make strong elements less bold for a more professional look */
+            strong {{
+                font-weight: 500;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <span style="font-size: 2rem;">🔍</span>
+            <h1>Data Review Assistant - Chat Export</h1>
+        </div>
+        <div class="chat-container">
+    """
+      # Process each message in the chat history
+    for role, message in st.session_state.chat_history:
+        is_user = role == "user"
+        message_type = "user" if is_user else "assistant"
+        icon = "📊" if is_user else "📋"
+        icon_class = "user-icon" if is_user else "assistant-icon"
+        
+        html += f"""
+        <div class="chat-message {message_type}-message">
+            <div class="message-icon {icon_class}">{icon}</div>
+            <div class="message-content">
+        """
+        # Process different types of messages
+        if isinstance(message, tuple):
+            file_obj, media_tag = message
+            ext = os.path.splitext(file_obj)[-1].lower()
+            if ext in [".png", ".jpg", ".jpeg"]:
+                # For images, we would need to convert to base64, but since we can't access the file directly
+                # in this context, we'll just note it was an image
+                html += f'<p>📎 Image file: <code>{os.path.basename(file_obj)}</code></p>'
+            else:
+                html += f'<p>🔎 File: <code>{os.path.basename(file_obj)}</code></p>'
+        elif isinstance(message, dict) and message.get('type') == 'dataframe':
+            # Convert DataFrame to HTML table with scrolling support
+            df = message['data']
+            # Use classes parameter to set dataframe-table class
+            table_html = df.to_html(index=False, classes='dataframe-table')
+            
+            # Create a container that will enforce horizontal scrolling for wide tables
+            html += f"""
+            <div style="overflow-x: auto; width: 100%; display: block; margin-bottom: 1rem;">
+                {table_html}
+            </div>
+            """
+        elif isinstance(message, dict) and message.get('type') == 'protocol_summary':
+            # Add protocol summary with styling, converting markdown to HTML
+            import markdown2
+            # Convert markdown to HTML for proper rendering with cleaner styling
+            summary_html = markdown2.markdown(message['summary'])
+            html += f"""
+            <div class="protocol-summary">
+                <div class="protocol-title">Protocol Summary:</div>
+                <div class="protocol-content">{summary_html}</div>
+            </div>
+            """
+        elif isinstance(message, dict) and message.get('type') == 'sql_queries_expander':
+            # Add SQL queries with styling
+            html += f"""
+            <div class="sql-queries-expander">
+                <div class="protocol-title">Generated SQL Query:</div>
+                <div class="protocol-content">
+            """
+            for i, query in enumerate(message['queries']):
+                html += f"""
+                <strong>Query {i+1}:</strong>
+                <pre class="sql-code">{query}</pre>
+                """
+            html += """
+                </div>
+            </div>
+            """
+        elif isinstance(message, dict) and message.get('type') == 'viz':
+            # Render Plotly figure as PNG and embed as base64 image
+            try:
+                import plotly.io as pio
+                fig = message['fig']
+                img_bytes = fig.to_image(format="png")
+                import base64
+                img_b64 = base64.b64encode(img_bytes).decode()
+                img_html = f'<img src="data:image/png;base64,{img_b64}" style="max-width:100%; border-radius:0.5rem; margin:1rem 0;"/>',
+                html += f"<div><div style='margin-bottom:0.5rem;'>{message['desc']}</div>{img_html}</div>"
+            except Exception as e:
+                html += f"<div><strong>Could not render chart:</strong> {e}</div>"
+        elif isinstance(message, dict) and message.get('type') == 'widget':
+            # Handle widget messages in chat history
+            widget_type = message.get('widget_type', '')
+            widget_data = message.get('data', {})
+            
+            if widget_type == 'file_uploader':
+                html += f"""
+                <div class="widget-container">
+                    <p><strong>📁 File Upload Required</strong></p>
+                    <p>{widget_data.get('description', 'Please upload a file to continue.')}</p>
+                </div>
+                """
+            elif widget_type == 'study_selector':
+                html += f"""
+                <div class="widget-container">
+                    <p><strong>📋 Study Selection</strong></p>
+                    <p>{widget_data.get('description', 'Please select a study to continue.')}</p>
+                </div>
+                """
+            elif widget_type == 'text_input':
+                html += f"""
+                <div class="widget-container">
+                    <p><strong>✏️ Input Required</strong></p>
+                    <p>{widget_data.get('description', 'Please provide the requested information.')}</p>
+                </div>
+                """
+            else:
+                html += f"""
+                <div class="widget-container">
+                    <p><strong>🔧 Interactive Widget</strong></p>
+                    <p>Interactive element was displayed here.</p>
+                </div>
+                """
+        else:
+            # Regular markdown text - convert markdown code blocks
+            content = str(message)
+            
+            # Handle SQL code blocks specially (```sql ... ``` format)
+            import re
+            # Replace code blocks with properly styled HTML
+            content = re.sub(
+                r'```(?:sql)?\n(.*?)```', 
+                r'<pre class="sql-code">\1</pre>', 
+                content, 
+                flags=re.DOTALL
+            )
+              # Use markdown2 for better conversion of markdown elements
+            import markdown2
+            # First handle the SQL code blocks which we've already processed
+            # Then convert the rest with markdown2
+            if "```" not in content:
+                content = markdown2.markdown(content)
+            else:
+                # Replace other markdown elements for better styling
+                content = content.replace("**", "<strong style=\"font-weight: 500;\">").replace("**", "</strong>")
+                content = content.replace("*", "<em>").replace("*", "</em>")
+                content = content.replace("\n", "<br>")
+            
+            html += content
+            
+        html += """
+            </div>
+        </div>
+        """
+    
+    # Add footer and closing tags
+    html += f"""
+        <div class="timestamp">
+            Exported on {datetime.now().strftime("%Y-%m-%d at %H:%M:%S")}
+        </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
+def create_download_button():
+    """Create a download button for exporting chat history as HTML"""
+    if len(st.session_state.chat_history) > 1:  # Only show if there's actual conversation
+        html_content = generate_html_export()
+        
+        # Create a download button
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        b64 = base64.b64encode(html_content.encode()).decode()
+        href = f'<a href="data:text/html;base64,{b64}" download="chat_export_{current_time}.html" style="text-decoration:none;">📥</a>'
+        return href
+    return ""
+
+def create_new_study(study_name):
+    """Create a new study with proper directory structure"""
+    try:
+        # Validate study name
+        if not DatabaseConnection.validate_study_name(study_name):
+            # Invalid study name handled silently
+            return False
+        
+        # Check if study already exists
+        existing_studies = DatabaseConnection.list_available_studies()
+        if study_name in existing_studies:
+            # Study exists handled silently
+            return False
+        
+        # Create the study
+        if DatabaseConnection.create_study_directories(study_name):
+            # Update available studies list
+            st.session_state.available_studies = DatabaseConnection.list_available_studies()
+            # Switch to the new study
+            st.session_state.current_study = study_name
+            # Reinitialize database connection and SQL generator
+            global db
+            db = get_current_db_connection()
+            st.session_state.sql_generator = SQLGenerator(study_name=study_name)
+            st.session_state.tables = db.list_tables()
+            # Reload column mappings for the new study
+            load_column_mappings(study_name)
+            # Sync chat history for the new study
+            sync_chat_history()
+            return True
+        return False
+    except Exception as e:
+        # Error creating study handled silently
+        return False
+
+def diagnose_study_issues(study_name):
+    """Diagnose and suggest fixes for study issues"""
+    issues = []
+    suggestions = []
+    
+    try:
+        study_dir = os.path.join(os.getcwd(), "studies", study_name)
+        data_dir = os.path.join(study_dir, "data")
+        protocols_dir = os.path.join(study_dir, "protocols")
+        db_path = DatabaseConnection.get_study_db_path(study_name)
+        
+        # Check directory structure
+        if not os.path.exists(study_dir):
+            issues.append("Study directory missing")
+            suggestions.append("Click 'Create New Study' to recreate")
+        
+        if not os.path.exists(data_dir):
+            issues.append("Data directory missing")
+            suggestions.append("Directory will be created automatically when uploading data")
+        
+        if not os.path.exists(protocols_dir):
+            issues.append("Protocols directory missing")
+            suggestions.append("Directory will be created automatically")
+        
+        # Check database file
+        if os.path.exists(db_path):
+            try:
+                # Test database connection
+                test_db = DatabaseConnection(study_name=study_name)
+                with test_db.get_connection() as conn:
+                    conn.execute("SELECT 1").fetchone()
+                
+                # Check if database is empty
+                tables = test_db.list_tables()
+                if not tables:
+                    issues.append("Database exists but contains no tables")
+                    suggestions.append("Upload CSV/Excel files to populate the database")
+                    
+            except sqlite3.DatabaseError:
+                issues.append("Database file is corrupted")
+                suggestions.append("Delete the corrupted database file and re-upload your data")
+            except PermissionError:
+                issues.append("Permission denied accessing database")
+                suggestions.append("Check file permissions or restart the application")
+        else:
+            issues.append("No database file found")
+            suggestions.append("Upload CSV/Excel files to create the database")
+        
+        # Check protocol files
+        protocol_files = ['protocol.pdf', 'annotation.pdf', 'QUESTIONS.csv']
+        missing_protocols = []
+        for file_name in protocol_files:
+            file_path = os.path.join(protocols_dir, file_name)
+            if not os.path.exists(file_path):
+                missing_protocols.append(file_name)
+        
+        if missing_protocols:
+            issues.append(f"Missing protocol files: {', '.join(missing_protocols)}")
+            suggestions.append(f"Place {', '.join(missing_protocols)} in the protocols directory")
+    
+    except Exception as e:
+        issues.append(f"Diagnostic error: {str(e)}")
+        suggestions.append("Try refreshing or restarting the application")
+    
+    return issues, suggestions
+
+def format_study_display_name(study_name, metadata):
+    """Format study name for dropdown display with status indicators"""
+    try:
+        table_count = metadata['table_count']
+        status = metadata['status']
+        has_error = metadata['has_error']
+        protocols = metadata['protocols']
+        
+        # Create status indicators
+        if has_error:
+            status_icon = "⚠️"
+            table_info = "error"
+        elif status == "no database":
+            status_icon = "📝"
+            table_info = "new"
+        elif table_count == 0:
+            status_icon = "📊"
+            table_info = "empty"
+        else:
+            status_icon = "✅"
+            table_info = f"{table_count} tables"
+        
+        # Check protocol status (only protocol.pdf)
+        protocol_exists = protocols.get('protocol.pdf', False)
+        if protocol_exists:
+            protocol_status = "protocol: ✅"
+        else:
+            protocol_status = "protocol: ❌"
+        
+        return f"{status_icon} {study_name} ({table_info}, {protocol_status})"
+        
+    except Exception:
+        return f"⚠️ {study_name} (connection error)"
+
+def extract_study_name_from_display(display_text):
+    """Safely extract study name from formatted display text"""
+    try:
+        # Handle different display formats:
+        # "✅ Study_Name (5 tables, protocols: ✅)"
+        # "⚠️ Study_Name (connection error)"
+        # "📝 Study_Name (new, protocols: ❌)"
+        
+        # Remove leading icon and space
+        if display_text.startswith(("✅", "⚠️", "📝", "📊")):
+            text_without_icon = display_text.split(" ", 1)[1] if " " in display_text else display_text
+        else:
+            text_without_icon = display_text
+        
+        # Extract name before the first opening parenthesis
+        study_name = text_without_icon.split(" (")[0]
+        return study_name.strip()
+        
+    except Exception:
+        # Fallback: try to clean the text as much as possible
+        import re
+        # Remove common status indicators and parenthetical content
+        cleaned = re.sub(r'^[✅⚠️📝📊]\s*', '', display_text)
+        cleaned = re.sub(r'\s*\([^)]*\).*$', '', cleaned)
+        return cleaned.strip()
+
+def switch_study(study_name):
+    """Switch to a different study"""
+    try:
+        # Store previous study for rollback if needed
+        previous_study = st.session_state.current_study
+        
+        # Update current study
+        st.session_state.current_study = study_name
+        
+        # Reinitialize database connection and SQL generator
+        global db
+        db = get_current_db_connection()
+        st.session_state.sql_generator = SQLGenerator(study_name=study_name)
+        st.session_state.tables = db.list_tables()
+        
+        # Reload column mappings for the new study
+        load_column_mappings(study_name)
+        
+        # Switch to study-specific chat history
+        sync_chat_history()
+        
+        # Show success message
+        if study_name:
+            # Switched to study silently
+            pass
+        else:
+            # Switched to none silently
+            pass
+            
+        return True
+    except Exception as e:
+        # Rollback on error
+        st.session_state.current_study = previous_study
+        if study_name:
+            # Error switching handled silently
+            pass
+        else:
+            # Error switching to none handled silently
+            pass
+        return False
+
+def show_delete_confirmation_dialog(study_name):
+    """Show delete confirmation dialog with safety measures"""
+    try:
+        # Get deletion information
+        deletion_info = DatabaseConnection.get_study_deletion_info(study_name)
+        
+        st.sidebar.error("⚠️ **DELETE STUDY CONFIRMATION**")
+        st.sidebar.markdown("**This action cannot be undone!**")
+        
+        if deletion_info['exists']:
+            # Show what will be deleted
+            st.sidebar.markdown("**📊 What will be deleted:**")
+            
+            # Format file size
+            total_size = deletion_info['total_size']
+            if total_size > 1024 * 1024:
+                size_str = f"{total_size / (1024 * 1024):.1f} MB"
+            elif total_size > 1024:
+                size_str = f"{total_size / 1024:.1f} KB"
+            else:
+                size_str = f"{total_size} bytes"
+            
+            st.sidebar.markdown(f"- **Study:** {study_name}")
+            st.sidebar.markdown(f"- **Database tables:** {deletion_info['table_count']}")
+            st.sidebar.markdown(f"- **Total files:** {deletion_info['total_files']}")
+            st.sidebar.markdown(f"- **Total size:** {size_str}")
+            
+            if deletion_info['protocol_files']:
+                st.sidebar.markdown("- **Protocol files:**")
+                for pfile in deletion_info['protocol_files']:
+                    psize = pfile['size']
+                    if psize > 1024:
+                        psize_str = f"{psize / 1024:.1f} KB"
+                    else:
+                        psize_str = f"{psize} bytes"
+                    st.sidebar.markdown(f"  - {pfile['name']} ({psize_str})")
+        
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**Type the study name to confirm deletion:**")
+        
+        # Confirmation input
+        confirmation_input = st.sidebar.text_input(
+            f"Type '{study_name}' to confirm:",
+            key="delete_confirmation_input",
+            placeholder="Enter study name here"
+        )
+        
+        # Action buttons
+        col1, col2 = st.sidebar.columns(2)
+        
+        with col1:
+            # Delete button (only enabled if confirmation matches)
+            delete_enabled = confirmation_input.strip() == study_name
+            if st.button(
+                "🗑️ DELETE", 
+                key="confirm_delete_btn", 
+                type="primary",
+                disabled=not delete_enabled,
+                help="This will permanently delete the study" if delete_enabled else f"Type '{study_name}' to enable deletion"
+            ):
+                if delete_study_and_cleanup(study_name):
+                    # Clear confirmation dialog
+                    st.session_state.show_delete_confirmation = False
+                    st.rerun()
+                else:
+                    # Clear confirmation dialog even on failure
+                    st.session_state.show_delete_confirmation = False
+                    st.rerun()
+        
+        with col2:
+            # Cancel button
+            if st.button("Cancel", key="cancel_delete_btn"):
+                st.session_state.show_delete_confirmation = False
+                st.rerun()
+        
+        # Additional warning
+        st.sidebar.warning("⚠️ This will permanently delete all data, database tables, and protocol files associated with this study.")
+        
+    except Exception as e:
+        st.session_state.show_delete_confirmation = False
+
+def delete_study_and_cleanup(study_name):
+    """Delete study and handle all cleanup operations"""
+    try:
+        if study_name == PROTECTED_STUDY:
+            st.error(f"🔒 Cannot delete protected example study: {study_name}")
+            print(f"Attempted to delete protected example study: {study_name}")
+            return False
+
+        # Check if this is the current study
+        is_current_study = st.session_state.current_study == study_name
+        
+        # Force close ALL database connections to prevent file locks
+        try:
+            # Close current database connection if it exists
+            global db
+            if 'db' in globals() and hasattr(db, '_connection') and db._connection:
+                db._connection.close()
+                print(f"Closed global database connection")
+        except Exception as e:
+            print(f"Error closing global database connection: {e}")
+        
+        # Force close any connections in session state
+        try:
+            if hasattr(st.session_state, 'sql_generator') and st.session_state.sql_generator:
+                if hasattr(st.session_state.sql_generator, 'db') and st.session_state.sql_generator.db:
+                    if hasattr(st.session_state.sql_generator.db, '_connection') and st.session_state.sql_generator.db._connection:
+                        st.session_state.sql_generator.db._connection.close()
+                        print(f"Closed SQL generator database connection")
+        except Exception as e:
+            print(f"Error closing SQL generator connection: {e}")
+        
+        # Force garbage collection to release any remaining connections
+        import gc
+        import time
+        gc.collect()
+        time.sleep(0.2)  # Give time for cleanup
+        
+        print(f"Attempting to delete study: {study_name}")
+        
+        # Perform the deletion
+        if DatabaseConnection.delete_study(study_name):
+            print(f"Study deletion successful: {study_name}")
+            # Update available studies list
+            st.session_state.available_studies = DatabaseConnection.list_available_studies()
+            
+            # If deleted study was current study, switch to none
+            if is_current_study:
+                st.session_state.current_study = None
+                # Update global database connection
+                db = get_current_db_connection()
+                st.session_state.sql_generator = SQLGenerator(study_name=None)
+                st.session_state.tables = db.list_tables()
+                load_column_mappings(None)
+                print(f"Switched away from deleted current study")
+            
+            return True
+        else:
+            print(f"Study deletion failed: {study_name}")
+            return False
+        
+    except Exception as e:
+        print(f"Error during study deletion cleanup: {str(e)}")
+        return False
+
+def render_study_selector():
+    """Render simple chat commands in sidebar"""
+    st.sidebar.header("💡 Chat Commands")
+    
+    st.sidebar.markdown("""
+• `list studies`
+• `create study` 
+• `upload data`
+• `upload protocol`
+• `cancel`
+    """)
+    
+    # Show current study
+    if st.session_state.current_study:
+        st.sidebar.success(f"📍 {st.session_state.current_study}")
+    else:
+        st.sidebar.info("📍 None")
+    
+    # Add unified file uploader
+    st.sidebar.markdown("---")
+    st.sidebar.header("📁 File Upload")
+    st.sidebar.caption("Use chat commands or upload files directly:")
+    
+    # Single file uploader for all file types
+    uploaded_file = st.sidebar.file_uploader(
+        "Choose file",
+        type=['csv', 'xlsx', 'pdf'],
+        key="unified_file_uploader",
+        help="Upload CSV/Excel data files or PDF protocol files"
+    )
+    
+    if uploaded_file is not None:
+        file_extension = uploaded_file.name.split('.')[-1].lower()
+        
+        if file_extension == 'pdf':
+            # Handle PDF protocol upload
+            handle_protocol_upload(uploaded_file)
+        elif file_extension in ['csv', 'xlsx']:
+            # Handle data file upload
+            handle_data_upload(uploaded_file)
+
+def handle_protocol_upload(uploaded_file):
+    """Handle protocol PDF file upload"""
+    try:
+        # Store protocol file in session state
+        st.session_state.pending_protocol_file = {
+            'filename': uploaded_file.name,
+            'content': uploaded_file.getbuffer()
+        }
+        
+        current_study = st.session_state.get('current_study')
+        if current_study:
+            if current_study == PROTECTED_STUDY:
+                st.success(f"📍 Currently active: **{current_study}** 🔒 (Example Study)")
+            else:
+                st.success(f"📍 Currently active: **{current_study}**")
+
+            # Save to current study
+            protocols_dir = os.path.join("studies", current_study, "protocols")
+            os.makedirs(protocols_dir, exist_ok=True)
+            
+            with open(os.path.join(protocols_dir, "protocol.pdf"), "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            st.sidebar.success(f"✅ Protocol uploaded: {uploaded_file.name}")
+            add_message_to_current_study(None, f"✅ Protocol file '{uploaded_file.name}' uploaded successfully")
+        else:
+            st.sidebar.success(f"✅ Protocol ready: {uploaded_file.name}")
+            add_message_to_current_study(None, f"✅ Protocol file '{uploaded_file.name}' ready for upload")
+            
+    except Exception as e:
+        st.sidebar.error(f"Error uploading protocol: {str(e)}")
+
+def handle_data_upload(uploaded_file):
+    """Handle data file upload (CSV/Excel)"""
+    try:
+        # Read the file
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+        
+        # Create table name from file name
+        table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
+        
+        current_study = st.session_state.get('current_study')
+        if current_study:
+            # Save to current study database
+            current_db = get_current_db_connection()
+            current_db.save_dataframe(df, table_name)
+            
+            st.sidebar.success(f"✅ Data uploaded: {uploaded_file.name}")
+            add_message_to_current_study(None, f"✅ Successfully uploaded {uploaded_file.name} as table '{table_name}' ({len(df)} rows)")
+        else:
+            # Store in session state for none
+            file_data = {
+                'df': df,
+                'table_name': table_name,
+                'filename': uploaded_file.name
+            }
+            
+            if not hasattr(st.session_state, 'pending_files'):
+                st.session_state.pending_files = []
+            
+            st.session_state.pending_files.append(file_data)
+            st.sidebar.success(f"✅ Data ready: {uploaded_file.name}")
+            add_message_to_current_study(None, f"✅ Data file '{uploaded_file.name}' ready for processing ({len(df)} rows)")
+            
+    except Exception as e:
+        st.sidebar.error(f"Error uploading data: {str(e)}")
+
+def main():
+    """Main application function"""
+    # Render study selector first (only if not on welcome screen and not in conversation mode)
+    conversation_mode = st.session_state.get('conversation_mode', 'normal')
+    # COMMENTED OUT: Hide chat commands from frontend completely
+    # if not st.session_state.show_welcome_screen and conversation_mode == 'normal':
+    #     render_study_selector()
+    
+    # Show workflow progress if in creation workflow
+    render_workflow_progress()
+    
+    # Create title with download button on the right
+    col1, col2, col3 = st.columns([15, 1, 1])
+    with col1:
+        st.title("Data Review Assistant")
+    
+    with col2:
+        # Add HTML export button
+        if len(st.session_state.chat_history) > 1:  # Only show if there's conversation
+            download_html = create_download_button()
+            st.markdown(f'<div style="text-align:right; margin-top:10px; font-size:24px;">{download_html}</div>', unsafe_allow_html=True)
+    
+    # Ensure data directory exists (study-aware)
+    if st.session_state.current_study:
+        study_data_dir = os.path.join(os.getcwd(), "studies", st.session_state.current_study, "data")
+        study_protocols_dir = os.path.join(os.getcwd(), "studies", st.session_state.current_study, "protocols")
+        os.makedirs(study_data_dir, exist_ok=True)
+        os.makedirs(study_protocols_dir, exist_ok=True)
+        protocols_dir = study_protocols_dir
+    else:
+        os.makedirs(os.path.join(os.getcwd(), "data"), exist_ok=True)
+        protocols_dir = os.path.join(os.getcwd(), "protocols")
+        os.makedirs(protocols_dir, exist_ok=True)
+    
+    # Check if protocol file exists, provide instructions if not
+    protocol_file_path = os.path.join(protocols_dir, "protocol.pdf")
+    if not os.path.exists(protocol_file_path):
+        # Protocol file check performed silently
+        pass
+    # Quietly check if annotation file exists
+    annotation_file_path = os.path.join(protocols_dir, "annotation.pdf")
+    
+    # Ensure chat history is synced for current study
+    sync_chat_history()
+    
+    # Initialize or validate database connection
+    try:
+        current_db = get_current_db_connection()
+        current_db.get_connection().__enter__().close()
+    except Exception as e:
+        st.error(f"Database connection error: {str(e)}")
+        st.info("Try restarting the application or check if the database file is accessible.")
+        return
+    
+    # Minimized sidebar - help commands and example questions
+    with st.sidebar:
+        st.markdown("### 🏠 Navigation")
+        if st.button("🏠 HOME", key="home_button", use_container_width=True, type="primary"):
+            st.session_state.show_welcome_screen = True
+            
+            try:
+                clinical_trial_dir = '/home/studies/Clinical Trial 2025'
+                data_dir = f'{clinical_trial_dir}/data'
+                protocols_dir = f'{clinical_trial_dir}/protocols'
+                
+                os.makedirs(data_dir, exist_ok=True)
+                os.makedirs(protocols_dir, exist_ok=True)
+                print(f"Ensured directory structure exists: {clinical_trial_dir}")
+            except Exception as e:
+                print(f"Error creating Clinical Trial 2025 directories: {e}")
+            
+            st.session_state.workflow_step = None
+            st.session_state.conversation_mode = 'normal'
+            st.session_state.pending_action = None
+            st.session_state.show_study_selector = False
+            st.session_state.last_study_list_question = None
+            st.session_state.selected_study_for_switch = None
+            st.session_state.pending_deletion = None
+            st.session_state.awaiting_deletion_selection = False
+            st.session_state.show_delete_confirmation = False
+            
+            if 'pending_files' in st.session_state:
+                st.session_state.pending_files = []
+            if 'pending_protocol_file' in st.session_state:
+                st.session_state.pending_protocol_file = None
+            
+            st.success("🏠 Returned to Home Screen")
+            st.rerun()
+        
+        st.markdown("---")
+        st.markdown("### 📝 Add/Update Study")
+        
+        if st.button("🚀 create new study", key="cmd_create_study", use_container_width=True, type="secondary"):
+            st.session_state.selected_question = "create new study"
+            st.rerun()
+        
+        if st.button("📚 list studies", key="cmd_list_studies", use_container_width=True, type="secondary"):
+            st.session_state.selected_question = "list studies"
+            st.rerun()
+        
+        if st.button("📤 upload data", key="cmd_upload_data", use_container_width=True, type="secondary"):
+            st.session_state.selected_question = "upload data"
+            st.rerun()
+        
+        if st.button("📋 upload protocol", key="cmd_upload_protocol", use_container_width=True, type="secondary"):
+            st.session_state.selected_question = "upload protocol"
+            st.rerun()
+        
+        st.markdown("---")
+        st.markdown("### 💡 Once you have uploaded your study data, click the example prompts or ask your own questions:")
+        
+        # Example questions
+        example_questions = [
+            "For every table in the database, provide the table name along with its total number of rows and columns",
+            "Are there any duplicate records in any of the tables?",
+            "What are the column names and data types for each table?",
+            "Show me a summary of the data in each table",
+            
+        ]
+        
+        # Add example questions to session state if not already there
+        if 'selected_question' not in st.session_state:
+            st.session_state.selected_question = ""
+        
+        # Display examples in the sidebar with smaller buttons
+        for i, question in enumerate(example_questions):
+            if st.button(f"{question[:50]}{'...' if len(question) > 50 else ''}", 
+                        key=f"sidebar_q{i+1}", 
+                        help=question,
+                        use_container_width=True):
+                st.session_state.selected_question = question
+                st.rerun()
+        
+        # File upload functionality moved to render_study_selector() sidebar
+    
+    # Main area for query interface
+    if st.session_state.show_welcome_screen:
+        display_welcome_screen()
+    else:
+        display_query_interface()
+
+if __name__ == "__main__":
+    main()
