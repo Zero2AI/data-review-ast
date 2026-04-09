@@ -22,157 +22,6 @@ import re
 
 DEFAULT_BEDROCK_MODEL = os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
 
-
-def quote_sql_identifier(identifier: str) -> str:
-    """Quote a SQL identifier for safe use in SQLite queries."""
-    return f'"{identifier.replace(chr(34), chr(34) * 2)}"'
-
-
-def parse_schema_tables(schema: str) -> Dict[str, List[str]]:
-    """Parse the plain-text schema block into a table-to-columns mapping."""
-    tables: Dict[str, List[str]] = {}
-    current_table: Optional[str] = None
-
-    for raw_line in (schema or "").splitlines():
-        line = raw_line.strip()
-        if line.startswith("Table:"):
-            current_table = line.split("Table:", 1)[1].strip()
-            if current_table:
-                tables[current_table] = []
-            continue
-
-        if current_table and line.startswith("- "):
-            column_def = line[2:].strip()
-            column_name = column_def.rsplit(" (", 1)[0].strip()
-            if column_name:
-                tables[current_table].append(column_name)
-
-    return tables
-
-
-def get_preferred_subject_identifier(schema: str) -> Optional[str]:
-    """Return the best patient/subject identifier present in the current schema."""
-    tables = parse_schema_tables(schema)
-    available = {col.lower(): col for cols in tables.values() for col in cols}
-
-    for candidate in [
-        "patient_display_id_full",
-        "SubjectID",
-        "subject_id",
-        "patient_id",
-        "PatientID",
-    ]:
-        match = available.get(candidate.lower())
-        if match:
-            return match
-
-    return None
-
-
-def is_global_duplicate_audit(question: str) -> bool:
-    """Detect broad requests to check duplicate records across the whole database."""
-    lower_question = (question or "").lower()
-    duplicate_terms = ["duplicate", "duplicates", "repeated", "unique", "distinct"]
-    scope_terms = [
-        "any of the tables",
-        "any table",
-        "all tables",
-        "across all tables",
-        "every table",
-        "each table",
-        "entire database",
-        "whole database",
-        "in the database",
-    ]
-    return any(term in lower_question for term in duplicate_terms) and any(
-        term in lower_question for term in scope_terms
-    )
-
-
-def choose_duplicate_key_columns(table_name: str, columns: List[str]) -> List[str]:
-    """Pick schema-safe grouping columns for duplicate detection in one table."""
-    if not columns:
-        return []
-
-    lower_map = {col.lower(): col for col in columns}
-
-    def existing(candidates: List[str]) -> List[str]:
-        matches = []
-        for candidate in candidates:
-            actual = lower_map.get(candidate.lower())
-            if actual and actual not in matches:
-                matches.append(actual)
-        return matches
-
-    if table_name.lower().endswith("_codes"):
-        return columns[: min(3, len(columns))]
-
-    preferred_columns = existing([
-        "studyname",
-        "patient_display_id_full",
-        "SubjectID",
-        "subject_id",
-        "Site",
-        "site",
-        "Visit",
-        "visit",
-        "Form",
-        "form",
-        "FormEntryDate",
-        "form_entry_date",
-        "interval_id",
-        "visit_id",
-        "folder_id",
-        "folder_name",
-        "page_id",
-        "page_name",
-        "VarGroup1Row",
-        "row_number",
-        "line_number",
-        "parent_record_id",
-        "record_type",
-    ])
-
-    if preferred_columns:
-        return preferred_columns
-
-    fallback_columns = [
-        col for col in columns
-        if not col.endswith("_CODED") and not col.endswith("_R")
-    ]
-    if fallback_columns:
-        return fallback_columns[: min(6, len(fallback_columns))]
-
-    return columns[: min(6, len(columns))]
-
-
-def generate_duplicate_queries_from_schema(schema: str) -> List[str]:
-    """Build duplicate-detection queries directly from the schema."""
-    queries: List[str] = []
-
-    for table_name, columns in parse_schema_tables(schema).items():
-        group_columns = choose_duplicate_key_columns(table_name, columns)
-        if not group_columns:
-            continue
-
-        quoted_table = quote_sql_identifier(table_name)
-        quoted_columns = [quote_sql_identifier(col) for col in group_columns]
-        select_columns = ", ".join(quoted_columns)
-        group_by_columns = ", ".join(quoted_columns)
-
-        query = (
-            f"SELECT '{table_name}' AS table_name, {select_columns}, "
-            f"COUNT(*) AS duplicate_count "
-            f"FROM {quoted_table} "
-            f"GROUP BY {group_by_columns} "
-            f"HAVING COUNT(*) > 1 "
-            f"ORDER BY duplicate_count DESC "
-            f"LIMIT 100;"
-        )
-        queries.append(query)
-
-    return queries
-
 def humanize_sql_error(error_msg: str, query: str) -> str:
     """
     Convert low-level SQL errors into user-friendly messages for non-technical users.
@@ -300,7 +149,7 @@ def process_annotation_content(content):
     if not result["mapping_examples"]:
         result["mapping_examples"] = "Term to column mappings:\n"
           # Always add specific mapping for patient IDs, regardless of whether other mappings were found
-    result["mapping_examples"] += "\n\nCRITICAL MAPPING: Use the patient or subject identifier column that actually exists in the schema. Prefer 'patient_display_id_full' when it is present. If it is not present, use the available identifier such as 'SubjectID'. Never invent an identifier column."
+    result["mapping_examples"] += "\n\nCRITICAL MAPPING: For ALL patient identification, ALWAYS use the column 'patient_display_id_full'. NEVER use 'patient_id' in any query. Replace ANY occurrence of 'patient_id' with 'patient_display_id_full' without exception."
       # Add specific mapping for lab value and unit columns pairing
     result["mapping_examples"] += "\n\nCRITICAL MAPPING: Lab values MUST ALWAYS be paired with their unit columns in SELECT statements. Examples of common pairs: LBORRES (value) with LBORRESU (unit), VSORRES (value) with VSORRESU (unit). Never select a value column without its corresponding unit column."
     
@@ -443,7 +292,7 @@ class SQLGenerator:
 3. Each table should be treated as a standalone data source first
 4. Only combine tables when the user specifically asks to relate or compare data
 5. Always translate domain terms to their correct database column names
-6. Use the patient or subject identifier column that actually exists in the schema. Prefer patient_display_id_full when it exists; otherwise use the available identifier such as SubjectID. Never invent an identifier column.
+6. ALWAYS use patient_display_id_full for ALL patient identification - NEVER use patient_id
 7. For lab tests like BICARBONATE, always search both LBTEST and LBTEST_R columns using OR conditions
 8. When JOINs are requested, fully qualify ALL column names with table names
 9. CRITICAL: For ANY lab value column (e.g., LBORRES), ALWAYS include its corresponding unit column (e.g., LBORRESU) in the SELECT statement
@@ -454,7 +303,7 @@ class SQLGenerator:
 
 SPECIAL CASE HANDLING:
 14. When querying for MISSING VALUES, include full table name and additional context columns like timestamps, primary keys, and any related identifier columns
-15. When detecting DUPLICATES, use only columns that actually exist in the target table and include relevant contextual fields from that same table
+15. When detecting DUPLICATES, always include ALL primary key columns and relevant contextual fields to help identify why duplicates exist
 16. For MULTI-TABLE queries, always fully qualify all column names with table names and include join conditions in the results"""
         
         # Get annotation content for the prompts
@@ -502,7 +351,6 @@ CRITICAL QUERY GENERATION RULES:
    - Start with a single table that has the needed data
    - Only use columns specifically mentioned in the question
    - Use schema-defined column names exactly
-   - Never reference a column unless it is explicitly listed for that table in the schema
    - Check for all possible variations of values in the data (e.g., if searching for a specific value, consider common abbreviations or alternate forms)
    - Use OR conditions when searching for values that might have variations
 
@@ -531,10 +379,11 @@ Example Query Patterns:
    -- For searching the same value across multiple columns:
    SELECT column1 FROM table1 WHERE (column2 LIKE '%value%' OR column3 LIKE '%value%');
    
-   -- CRITICAL: Use patient_display_id_full only when that column exists in the schema:
+   -- CRITICAL: For patient identification, ALWAYS use patient_display_id_full:
    -- CORRECT:
    SELECT patient_display_id_full FROM chemistry_cel WHERE condition;
-   -- If patient_display_id_full is not present, use the actual subject identifier from the schema such as SubjectID.
+   -- WRONG (NEVER DO THIS):
+   -- SELECT patient_id FROM chemistry_cel WHERE condition;
      -- CRITICAL: For lab test values like BICARBONATE, always search both LBTEST and LBTEST_R:
    SELECT * FROM lab_results WHERE (LBTEST LIKE '%BICARBONATE%' OR LBTEST_R LIKE '%BICARBONATE%');
      -- CRITICAL: ALWAYS include unit columns with their corresponding value columns:
@@ -561,7 +410,7 @@ Example Query Patterns:
 
 Special Case Instructions:
 - For queries about MISSING VALUES: Include full table name (e.g., table_name.column_name) for all columns and include context columns like patient identifiers and date/time columns to provide more context.
-- For queries about DUPLICATES: Always include only columns that actually exist in that table. Never copy SubjectID, patient_display_id_full, Visit, Form, or any other identifier into a table unless the schema for that table lists it. For lookup/reference tables such as *_codes, use only their real columns or skip them.
+- For queries about DUPLICATES: Always include ALL primary key columns and additional context columns that help identify the duplicates. Use COUNT(*) and GROUP BY for efficient duplicate detection.
 - For MULTI-TABLE queries: Fully qualify ALL column names with table names (e.g., table1.column1, table2.column2) and include explicit join conditions.
 
 Generate a SQL query that answers ONLY what was asked:
@@ -620,7 +469,6 @@ SQL Query:""",
         """
         max_retries = 2
         retry_count = 0
-        subject_identifier = get_preferred_subject_identifier(schema)
         
         # Detect special cases for enhanced query handling
         is_missing_values = any(term in question.lower() for term in ["missing", "null", "empty", "absent", "not present"])
@@ -631,15 +479,10 @@ SQL Query:""",
             try:
                 # Build special case instructions based on detected cases
                 special_case_instructions = ""
-                if subject_identifier:
-                    special_case_instructions += (
-                        f"\nFor this schema, use '{subject_identifier}' as the subject identifier "
-                        "when a patient or subject field is needed. Do not invent other identifier columns."
-                    )
                 if is_missing_values:
                     special_case_instructions += "\nFor this MISSING VALUES query: Include full table name for all columns and include context columns like patient identifiers and date/time columns."
                 if is_duplicates:
-                    special_case_instructions += "\nFor this DUPLICATES query: Use only columns listed for the target table. If a table does not have subject-level fields, use only the columns that exist in that table."
+                    special_case_instructions += "\nFor this DUPLICATES query: Include ALL primary key columns and additional context columns that help identify the duplicates."
                 if is_multi_table:
                     special_case_instructions += "\nFor this MULTI-TABLE query: Fully qualify ALL column names with table names and include explicit join conditions."
                 
@@ -730,17 +573,11 @@ SQL Query:""",
         """
         max_retries = 2
         retry_count = 0
-        subject_identifier = get_preferred_subject_identifier(schema)
         
         # Detect special cases for enhanced query handling
         is_missing_values = any(term in question.lower() for term in ["missing", "null", "empty", "absent", "not present"])
         is_duplicates = any(term in question.lower() for term in ["duplicate", "duplicates", "repeated", "unique", "distinct"])
         is_multi_table = any(term in question.lower() for term in [" join ", "across tables", "multiple tables", "between tables"])
-
-        if is_global_duplicate_audit(question):
-            generated_queries = generate_duplicate_queries_from_schema(schema)
-            if generated_queries:
-                return generated_queries
           
         # Add annotation information if available
         annotation_section = ""        
@@ -773,7 +610,7 @@ INSTRUCTIONS FOR TERM TRANSLATION:
 2. Check if these terms have corresponding database column names in the annotation file.
 3. Use the database column names (like "LBORRES") in your query instead of the common terms.
 4. Pay special attention to column names in the schema that might represent coded values.
-5. CRITICAL: Use the patient or subject identifier column that actually exists in the schema. Prefer 'patient_display_id_full' when it exists; otherwise use the available identifier such as 'SubjectID'. Never invent an identifier column.
+5. CRITICAL: For ALL patient identification, ALWAYS use 'patient_display_id_full' - NEVER use 'patient_id'.
 6. CRITICAL: For ANY lab value column (e.g., LBORRES), ALWAYS include its corresponding unit column (e.g., LBORRESU) in the SELECT statement.
 7. NEVER make assumptions about unit conversions - do not automatically convert between units unless explicitly requested by the user.
 8. If a query mentions units, search for that exact value and unit without conversion.
@@ -787,7 +624,7 @@ Bicarbonate data is stored in "LBORRES" column, your query should use "LBORRES" 
 
 Special Case Instructions:
 - For queries about MISSING VALUES: Include full table name (e.g., table_name.column_name) for all columns and include context columns like patient identifiers and date/time columns to provide more context.
-- For queries about DUPLICATES: Use only columns that actually exist in the current table. Never copy SubjectID, patient_display_id_full, Visit, Form, or other identifiers into a table unless they appear in that table's schema. For lookup/reference tables such as *_codes, use only their real columns or skip them.
+- For queries about DUPLICATES: Always include ALL primary key columns and additional context columns that help identify the duplicates. Use COUNT(*) and GROUP BY for efficient duplicate detection.
 - For MULTI-TABLE queries: Fully qualify ALL column names with table names (e.g., table1.column1, table2.column2) and include explicit join conditions.
 
 Break down this complex request into multiple SQL queries as needed. The queries should be:
@@ -832,15 +669,10 @@ SQL Queries:""",
             try:
                 # Build special case instructions based on detected cases
                 special_case_instructions = ""
-                if subject_identifier:
-                    special_case_instructions += (
-                        f"\nFor this schema, use '{subject_identifier}' as the subject identifier "
-                        "when a patient or subject field is needed. Do not invent other identifier columns."
-                    )
                 if is_missing_values:
                     special_case_instructions += "\nFor this MISSING VALUES query: Include full table name for all columns and include context columns like patient identifiers and date/time columns."
                 if is_duplicates:
-                    special_case_instructions += "\nFor this DUPLICATES query: Generate each query from the actual columns in that table only. If a table lacks subject-level fields, do not invent them."
+                    special_case_instructions += "\nFor this DUPLICATES query: Include ALL primary key columns and additional context columns that help identify the duplicates."
                 if is_multi_table:
                     special_case_instructions += "\nFor this MULTI-TABLE query: Fully qualify ALL column names with table names and include explicit join conditions."
                 

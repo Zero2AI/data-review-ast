@@ -13,7 +13,6 @@ from io import BytesIO
 import base64
 from datetime import datetime
 import uuid
-import re
 
 
 PROTECTED_STUDY = "Clinical Trial 2025"
@@ -165,66 +164,6 @@ def apply_column_mapping(df):
         return df
     # Only rename columns that are in the mapping
     return df.rename(columns={col: mapping.get(col, col) for col in df.columns})
-
-
-def extract_table_name_from_query(query_text):
-    """Extract a table name from a SQL query when possible."""
-    if not query_text:
-        return None
-
-    match = re.search(r'FROM\s+"?([A-Za-z0-9_.]+)"?', query_text, re.IGNORECASE)
-    return match.group(1) if match else None
-
-
-def format_query_error_summary(errors_df):
-    """Convert query execution errors into a short user-facing summary."""
-    if not isinstance(errors_df, pd.DataFrame) or errors_df.empty:
-        return "Some queries could not be run."
-
-    summary_lines = ["Some queries could not be run:"]
-    seen_messages = set()
-
-    for _, row in errors_df.iterrows():
-        reason = str(row.get("error_message", "")).strip() or "Unknown error."
-        table_name = extract_table_name_from_query(row.get("query_text", ""))
-        line = f"- {table_name}: {reason}" if table_name else f"- {reason}"
-        if line not in seen_messages:
-            summary_lines.append(line)
-            seen_messages.add(line)
-
-    return "\n".join(summary_lines)
-
-
-def format_query_exception_message(error):
-    """Convert unexpected query-processing exceptions into readable user text."""
-    message = str(error).strip()
-    lower_message = message.lower()
-
-    if not message:
-        return "I couldn't complete that request. Please try rephrasing the question."
-
-    if (
-        "error generating sql query" in lower_message
-        or "error generating multiple sql queries" in lower_message
-        or "unexpected response format" in lower_message
-    ):
-        return (
-            "I couldn't build a valid query for that request. "
-            "Please rephrase the question and try again."
-        )
-
-    if message.startswith("I couldn't") or message.startswith("The field '") or message.startswith("The dataset "):
-        return message
-
-    return (
-        "I couldn't complete that request because it did not match the available data cleanly. "
-        "Please rephrase the question and try again."
-    )
-
-
-def format_secondary_generation_error(task_name):
-    """Return a readable non-technical message for optional post-processing steps."""
-    return f"I ran the query, but I couldn't generate the {task_name} for this result."
 
 # Define callback to handle chat input to ensure consistent processing
 def handle_chat_input(text_input):
@@ -2505,7 +2444,7 @@ What would you like to do?"""
                         }
                         response_messages.append(protocol_message)
                 except Exception as e:
-                    response_messages.append(format_secondary_generation_error("data summary"))
+                    response_messages.append(f"Error generating protocol summary: {str(e)}")
                 
                 # Convert single result to multi-query format for consistent processing
                 results_dict = {"query_1": result_df}
@@ -2541,11 +2480,12 @@ What would you like to do?"""
                         }
                         response_messages.append(protocol_message)
                 except Exception as e:
-                    response_messages.append(format_secondary_generation_error("data summary"))
+                    response_messages.append(f"Error generating protocol summary: {str(e)}")
             
             # Process and store results
             if "errors" in results_dict:
-                response_messages.append(format_query_error_summary(results_dict["errors"]))
+                response_messages.append("Some queries encountered errors:\n")
+                response_messages.append({"type": "dataframe", "data": results_dict["errors"]})
             
             # Process results
             has_results = False
@@ -2557,14 +2497,7 @@ What would you like to do?"""
                     response_messages.append({"type": "dataframe", "data": df})
 
             if not has_results:
-                is_duplicate_question = any(
-                    term in question_text.lower()
-                    for term in ["duplicate", "duplicates", "repeated", "unique", "distinct"]
-                )
-                if is_duplicate_question:
-                    response_messages.append("No duplicate records were found in the checked tables.")
-                else:
-                    response_messages.append("The query returned no results.")
+                response_messages.append("The query returned no results.")
 
             # Only create visualizations if the user explicitly asks for it
             if should_show_visualization(question_text) and non_empty_dfs:
@@ -2583,13 +2516,13 @@ What would you like to do?"""
                     viz_result = generate_visualization_code(viz_df, question_text)
                     
                     if viz_result["error"]:
-                        response_messages.append("I couldn't generate a visualization for this result.")
+                        response_messages.append(f"Could not generate visualization: {viz_result['error']}")
                     elif viz_result["code"]:
                         # Execute the generated code
                         exec_result = execute_visualization_code(viz_result["code"], viz_df)
                         
                         if exec_result["error"]:
-                            response_messages.append("I couldn't render a visualization for this result.")
+                            response_messages.append(f"Could not execute visualization: {exec_result['error']}")
                         elif exec_result["fig"]:
                             response_messages.append({
                                 "type": "viz", 
@@ -2602,12 +2535,13 @@ What would you like to do?"""
                         response_messages.append("No visualization code was generated.")
                         
                 except Exception as e:
-                    response_messages.append("I couldn't create a visualization for this result.")
+                    response_messages.append(f"Could not create visualization: {str(e)}")
             
             # Automatic visualization suggestions have been disabled
             # Users can still manually request visualizations        
         except Exception as e:
-            response_messages.append(format_query_exception_message(e))
+            response_messages.append("Error processing query")
+            response_messages.append(f"**Error Details:**\n```\n{str(e)}\n```")          # Update the placeholder with the final response and add to chat history
         message_box.empty()
         for message in response_messages:
             with st.chat_message("assistant"):
@@ -2662,7 +2596,8 @@ def handle_query_response(results, is_multi_query=False):
     
     if is_multi_query:
         if "errors" in results:
-            response_messages.append(format_query_error_summary(results["errors"]))
+            response_messages.append("Some queries encountered errors:\n")
+            response_messages.append({"type": "dataframe", "data": apply_column_mapping(results["errors"])})
         
         has_results = any(not df.empty for k, df in results.items() if k != "errors")
         
