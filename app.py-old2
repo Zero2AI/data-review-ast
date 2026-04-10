@@ -167,22 +167,6 @@ def apply_column_mapping(df):
     return df.rename(columns={col: mapping.get(col, col) for col in df.columns})
 
 
-def read_uploaded_tabular_file(uploaded_file):
-    """Read a CSV or Excel upload, including legacy .xls files."""
-    filename = (uploaded_file.name or "").lower()
-
-    if filename.endswith('.csv'):
-        return pd.read_csv(uploaded_file)
-
-    if filename.endswith('.xlsx'):
-        return pd.read_excel(uploaded_file)
-
-    if filename.endswith('.xls'):
-        return pd.read_excel(uploaded_file, engine="xlrd")
-
-    raise ValueError("Unsupported file type. Please upload a CSV, XLSX, or XLS file.")
-
-
 def extract_table_name_from_query(query_text):
     """Extract a table name from a SQL query when possible."""
     if not query_text:
@@ -612,10 +596,10 @@ def render_data_uploader():
     
     uploaded_data = st.file_uploader(
         "Choose data files",
-        type=['csv', 'xlsx', 'xls'],
+        type=['csv', 'xlsx'],
         accept_multiple_files=True,
         key=widget_key,
-        help="Upload your study data files (CSV, XLSX, or XLS format)"
+        help="Upload your study data files (CSV or Excel format)"
     )
     
     # Place Complete Setup button on the left side below the file uploader
@@ -636,7 +620,10 @@ def render_data_uploader():
                     continue
                 
                 # Read the file
-                df = read_uploaded_tabular_file(uploaded_file)
+                if uploaded_file.name.endswith('.csv'):
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
                 
                 # Create table name from file name
                 table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
@@ -688,7 +675,10 @@ def handle_study_creation_complete(uploaded_files):
         for uploaded_file in uploaded_files:
             try:
                 # Read the file
-                df = read_uploaded_tabular_file(uploaded_file)
+                if uploaded_file.name.endswith('.csv'):
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
                 
                 # Create table name from file name
                 table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
@@ -1101,7 +1091,10 @@ def render_file_uploader():
                     for uploaded_file in uploaded_files:
                         try:
                             # Read the file
-                            df = read_uploaded_tabular_file(uploaded_file)
+                            if uploaded_file.name.endswith('.csv'):
+                                df = pd.read_csv(uploaded_file)
+                            else:
+                                df = pd.read_excel(uploaded_file)
                             
                             # Create table name from file name
                             table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
@@ -1227,12 +1220,15 @@ def handle_workflow_steps(question_text):
 # Helper functions for file upload
 def upload_file():
     """Handle file upload and database storage"""
-    uploaded_file = st.file_uploader("Choose a CSV or Excel file", type=['csv', 'xlsx', 'xls'])
+    uploaded_file = st.file_uploader("Choose a CSV or Excel file", type=['csv', 'xlsx'])
     
     if uploaded_file is not None:
         try:
             # Read the file
-            df = read_uploaded_tabular_file(uploaded_file)
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
             
             # Create table name from file name
             table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
@@ -1254,7 +1250,7 @@ def upload_file():
 
 def upload_files():
     """Handle multiple file uploads and database storage"""
-    uploaded_files = st.file_uploader("Choose CSV, Excel, or PDF files", type=['csv', 'xlsx', 'xls', 'pdf'], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Choose CSV, Excel, or PDF files", type=['csv', 'xlsx', 'pdf'], accept_multiple_files=True)
     
     if uploaded_files:
         files_processed = 0
@@ -1284,7 +1280,10 @@ def upload_files():
                         
                     else:
                         # Handle CSV/Excel files (existing logic)
-                        df = read_uploaded_tabular_file(uploaded_file)
+                        if uploaded_file.name.endswith('.csv'):
+                            df = pd.read_csv(uploaded_file)
+                        else:
+                            df = pd.read_excel(uploaded_file)
                         
                         # Create table name from file name
                         table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
@@ -1318,10 +1317,8 @@ def process_file(file_path):
     try:
         if file_path.endswith('.csv'):
             df = pd.read_csv(file_path)
-        elif file_path.endswith('.xlsx'):
+        elif file_path.endswith('.xlsx') or file_path.endswith('.xls'):
             df = pd.read_excel(file_path)
-        elif file_path.endswith('.xls'):
-            df = pd.read_excel(file_path, engine="xlrd")
         else:
             return None
         return df
@@ -3670,9 +3667,9 @@ def render_study_selector():
     # Single file uploader for all file types
     uploaded_file = st.sidebar.file_uploader(
         "Choose file",
-        type=['csv', 'xlsx', 'xls', 'pdf'],
+        type=['csv', 'xlsx', 'pdf'],
         key="unified_file_uploader",
-        help="Upload CSV/XLSX/XLS data files or PDF protocol files"
+        help="Upload CSV/Excel data files or PDF protocol files"
     )
     
     if uploaded_file is not None:
@@ -3681,7 +3678,7 @@ def render_study_selector():
         if file_extension == 'pdf':
             # Handle PDF protocol upload
             handle_protocol_upload(uploaded_file)
-        elif file_extension in ['csv', 'xlsx', 'xls']:
+        elif file_extension in ['csv', 'xlsx']:
             # Handle data file upload
             handle_data_upload(uploaded_file)
 
@@ -3721,7 +3718,10 @@ def handle_data_upload(uploaded_file):
     """Handle data file upload (CSV/Excel)"""
     try:
         # Read the file
-        df = read_uploaded_tabular_file(uploaded_file)
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
         
         # Create table name from file name
         table_name = os.path.splitext(uploaded_file.name)[0].lower().replace(" ", "_")
